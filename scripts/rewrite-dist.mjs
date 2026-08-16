@@ -55,6 +55,18 @@ const MANIFEST_RULES = [
   ['"scope": "/"', `"scope": "${prefix}/"`],
   ['"id": "/"', `"id": "${prefix}/"`],
 ]
+// The generic connection RPC channel constant ("/api") is prefixed by TEXT_RULES
+// into a multi-segment path ("/app/dsh/api"), but the client validates channel
+// strings against a single-segment pattern; without this widening every generic
+// RPC call (commands/list, commands/execute, …) throws client-side before any
+// network I/O — the slash-command menu and the permission preset switch die
+// silently. Server-side copies (lib/index.js) are not client bundles: they keep
+// the original single-segment constant and must stay untouched.
+const CHANNEL_PATTERN_RULE = [
+  [String.raw`/^\/[A-Za-z0-9._~-]+$/`, String.raw`/^\/[A-Za-z0-9._~\/-]+$/`],
+]
+const ruleSetsFor = (file) =>
+  file.endsWith('.webmanifest') ? [TEXT_RULES, MANIFEST_RULES] : [TEXT_RULES, CHANNEL_PATTERN_RULE]
 
 /** Collect the ./client export target(s) of one package exports map. */
 function clientExportTargets(exportsMap) {
@@ -122,22 +134,21 @@ const clientBundles = discoverClientBundles()
 
 // Same-version rebuilds re-run this script over an already-rewritten tree,
 // where the patterns below no longer match and the count gates would fail.
-// Detect that state by the prefixed forms themselves and skip.
+// Detect that state by the prefixed forms themselves and skip. The widened
+// channel pattern must be present too, so a tree rewritten before the
+// CHANNEL_PATTERN_RULE existed still receives the missing regex fix.
 {
   const htmlNow = fs.readFileSync(path.join(dist, 'index.html'), 'utf8')
   const connBundle = clientBundles.find((file) => file.includes('dsh-client-connection'))
   const jsNow = connBundle === undefined ? '' : fs.readFileSync(connBundle, 'utf8')
-  if (htmlNow.includes(`"${prefix}/assets/`) && jsNow.includes(`"${prefix}/api`)) {
+  if (htmlNow.includes(`"${prefix}/assets/`) && jsNow.includes(`"${prefix}/api`) && jsNow.includes(CHANNEL_PATTERN_RULE[0][1])) {
     console.log('Runtime already carries the gateway prefix; rewrite skipped.')
     process.exit(0)
   }
 }
 
-for (const file of walk(dist)) {
-  const rules = file.endsWith('.webmanifest') ? [TEXT_RULES, MANIFEST_RULES] : [TEXT_RULES]
-  rewriteFile(file, rules)
-}
-for (const file of clientBundles) rewriteFile(file, [TEXT_RULES])
+for (const file of walk(dist)) rewriteFile(file, ruleSetsFor(file))
+for (const file of clientBundles) rewriteFile(file, ruleSetsFor(file))
 
 // --- verification -----------------------------------------------------------
 
@@ -153,13 +164,15 @@ if (connectionBundle === undefined) {
   if (!contents.includes(`"${prefix}/api`)) {
     failures.push('dsh-client-connection client bundle: no /api rewrite landed')
   }
+  if (!contents.includes(CHANNEL_PATTERN_RULE[0][1])) {
+    failures.push('dsh-client-connection client bundle: channel pattern not widened for the multi-segment prefix (generic RPC would throw client-side)')
+  }
 }
 
 // No root-absolute escapes may remain in anything we rewrote.
 for (const { file } of report) {
   const contents = fs.readFileSync(file, 'utf8')
-  const ruleSets = file.endsWith('.webmanifest') ? [TEXT_RULES, MANIFEST_RULES] : [TEXT_RULES]
-  for (const rules of ruleSets) {
+  for (const rules of ruleSetsFor(file)) {
     for (const [from] of rules) {
       if (contents.includes(from)) failures.push(`${path.relative(root, file)} still contains unrewritten ${from}`)
     }
