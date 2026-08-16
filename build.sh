@@ -51,6 +51,20 @@ else
   node scripts/fetch-dsh.mjs
 fi
 
+# Icons are exported @2x from the 600x600 master (assets/ICON.png) by
+# make-icons.mjs; regenerate automatically when the master is newer than any
+# export (or one is missing). Needs sharp from the staged runtime tree, so it
+# runs after the fetch/staging block above.
+icons_fresh=yes
+for f in src/ICON.PNG src/ICON_256.PNG src/app/ui/images/icon_64.png src/app/ui/images/icon_256.png; do
+  [ -f "$f" ] && [ ! assets/ICON.png -nt "$f" ] || icons_fresh=no
+done
+if [ "$icons_fresh" = yes ]; then
+  echo "Icons up to date with assets/ICON.png; skipping regeneration."
+else
+  node scripts/make-icons.mjs
+fi
+
 node scripts/rewrite-dist.mjs
 node scripts/pack-runtime.mjs
 

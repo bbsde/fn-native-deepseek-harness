@@ -51,6 +51,9 @@ src/app/runtime.tar.gz  # 构建期生成：runtime 整树单文件 tar（33k �
                       #   安装秒级；cmd/install_callback 解压到 $TRIM_PKGVAR/runtime）
 scripts/             # fetch-dsh / rewrite-dist / build / 本地与真机测试脚本
 package.json         # dshVersion 钉死上游版本
+assets/ICON.png      # 图标母版 600x600；make-icons.mjs 导出 @2x（64pt→128px、
+                      #   256pt→512px，fnOS 桌面按 HiDPI 2x 渲染）。build.sh 带
+                      #   新鲜度守卫：母版比导出图新则打包时自动重生成。
 ```
 
 ## 构建（必须理解远程安装的原因）
