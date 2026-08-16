@@ -6,7 +6,7 @@
   "scripts": {
     "fetch": "node scripts/fetch-dsh.mjs",
     "rewrite": "node scripts/rewrite-dist.mjs",
-    "icons": "python scripts/make-icons.py",
+    "icons": "node scripts/make-icons.mjs",
     "build": "node scripts/build.mjs"
   },
   "dshVersion": "0.1.0-rc.6"
