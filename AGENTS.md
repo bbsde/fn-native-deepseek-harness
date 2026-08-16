@@ -4,7 +4,7 @@
 上游：https://github.com/deepseek-ai/deepseek-harness （MIT，npm 包 `@deepseek-ai/dsh`）。
 
 命名约定：**应用标识一律用 `dsh`**（appname、网关前缀 `/app/dsh`、运行用户 `dsh`、共享目录
-`dsh/workspace`、显示名 `DSH`）；只有仓库名保留全称 fn-native-deepseek-harness。
+`dsh/workspace`、显示名 `DS·H`）；只有仓库名保留全称 fn-native-deepseek-harness。
 
 ## 架构（为什么长这样）
 
@@ -108,7 +108,7 @@ ssh nas31 'sudo curl -s --unix-socket /vol1/@appcenter/dsh/app.sock \
 - **uninstall 后要 sleep 几秒再 install**：卸载未完全落稳时紧接着 install-fpk 可能静默失败
   （症状：app list 里没有应用、@appdata 目录缺失）。排查时不要用 grep 过滤安装输出，看全文。
 - 卸载后 `/vol1/@appdata/dsh` 等数据目录会保留（fnOS 行为）；要彻底清理需手动删。
-- 浏览器端最终验证：管理员账号登录 NAS 桌面 → 打开 DSH → 设置→模型 填 API Key。
+- 浏览器端最终验证：管理员账号登录 NAS 桌面 → 打开 DS·H → 设置→模型 填 API Key。
 
 ## 本地验证（Windows 开发机，Git Bash）
 

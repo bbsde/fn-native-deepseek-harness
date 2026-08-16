@@ -1,7 +1,7 @@
 # fn-native-deepseek-harness
 
 把 [DeepSeek Harness（dsh）](https://github.com/deepseek-ai/deepseek-harness) 打包为飞牛 fnOS
-原生应用（.fpk）。应用标识为 `dsh`，显示名 **DSH**，通过统一网关 `/app/dsh` 访问。
+原生应用（.fpk）。应用标识为 `dsh`，显示名 **DS·H**，通过统一网关 `/app/dsh` 访问。
 
 ## 设计要点
 
@@ -42,7 +42,7 @@ ssh nas31 'sudo /usr/local/bin/appcenter-cli install-fpk --volume 1 /tmp/dsh.fpk
 ssh nas31 'sudo /usr/local/bin/appcenter-cli start dsh'
 ```
 
-管理员账号登录 NAS 桌面，打开 DSH，在 设置→模型 填入 API Key 即可使用。
+管理员账号登录 NAS 桌面，打开 DS·H，在 设置→模型 填入 API Key 即可使用。
 Agent 产出的文件默认在共享目录 `dsh/workspace`。
 
 ## 验证
