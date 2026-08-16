@@ -14,7 +14,7 @@
 ```
 浏览器 → fnOS 统一网关 /app/dsh（NAS 登录态，转发 X-Trim-* 头）
         → Unix socket /var/apps/dsh/target/app.sock（实际在 /vol1/@appcenter/dsh/app.sock）
-        → relay（fpk/app/bin/relay.mjs，Node）
+        → relay（src/app/bin/relay.mjs，Node）
             - 校验 X-Trim-Isadmin === 'true'，否则 403（此入口等价于主机 shell，管理员专用）
             - 剥 /app/dsh 前缀
             - Host/Origin/Referer 重写为 127.0.0.1:3080（通过 dsh 的 browser-trust fence）
@@ -42,8 +42,8 @@
 ## 目录
 
 ```
-fpk/                 # fnpack 打包根（manifest、config/、cmd/、app/bin/relay.mjs、app/ui/）
-fpk/app/dsh/         # 构建期生成：Linux x64 的 @deepseek-ai/dsh node_modules（勿手改，勿提交）
+src/                 # fnpack 打包根（manifest、config/、cmd/、app/bin/relay.mjs、app/ui/）
+src/app/dsh/         # 构建期生成：Linux x64 的 @deepseek-ai/dsh node_modules（勿手改，勿提交）
 scripts/             # fetch-dsh / rewrite-dist / build / 本地与真机测试脚本
 package.json         # dshVersion 钉死上游版本
 ```
@@ -86,7 +86,7 @@ x86_64，fnOS 1.1.3105）。`appcenter-cli` 在 `/usr/local/bin/appcenter-cli`�
 
 ```bash
 npm run build                                        # 1. 本地出 fpk（fetch 在 nas31 上远程执行）
-scp fpk/dsh.fpk nas31:/tmp/                          # 2. 上传
+scp src/dsh.fpk nas31:/tmp/                          # 2. 上传
 ssh nas31 'sudo /usr/local/bin/appcenter-cli install-fpk --volume 1 /tmp/dsh.fpk'   # 3. 安装
 ssh nas31 'sudo /usr/local/bin/appcenter-cli start dsh'        # 4. 启动
 ssh nas31 'sudo /usr/local/bin/appcenter-cli status dsh'       # 5. 状态
@@ -114,7 +114,7 @@ ssh nas31 'sudo curl -s --unix-socket /vol1/@appcenter/dsh/app.sock \
 
 ```bash
 # relay TCP 模式（注意 Windows 本地跑 dsh web 可行但不含 Linux 原生模块路径场景）
-node fpk/app/bin/relay.mjs --tcp-port 13080 --target 127.0.0.1:3080 --prefix /app/dsh
+node src/app/bin/relay.mjs --tcp-port 13080 --target 127.0.0.1:3080 --prefix /app/dsh
 node scripts/test-boot-sequence.mjs     # 模拟浏览器启动：首页→插件图→bundle→langs chunk
 node scripts/test-ws-upgrade.mjs        # WebSocket 101 升级
 ```
@@ -126,7 +126,7 @@ curl 检查要点：无 `X-Trim-Isadmin` → 403；带 admin + 任意 Host → 2
 
 - relay 的 `--test-allow-anonymous` **只允许本地验证**，cmd/main 与任何生产调用不得出现。
 - 不改上游源码；所有适配都在 relay 与构建期重写里。
-- 不要把 `fpk/app/dsh/node_modules` 提交进仓库（构建期生成）。
+- 不要把 `src/app/dsh/node_modules` 提交进仓库（构建期生成）。
 - Git Bash 下传 `/app/...` 之类参数给 node 时加 `MSYS_NO_PATHCONV=1`，否则参数被路径转换污染；
   node 脚本里远程命令一律走 `spawnSync('ssh', [host,'bash -s'], {input})`，别过 Windows shell。
 - 上游 `.credentials.yaml` 强制 owner-only 权限位——DSH_HOME 永远放 `TRIM_PKGVAR`。

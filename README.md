@@ -9,7 +9,7 @@
 因此本封装不绕过上游安全模型，而是：
 
 - **统一网关**：fnOS 登录态在前，桌面内 iframe 打开 `/app/dsh`；入口仅管理员可见。
-- **relay 适配层**（`fpk/app/bin/relay.mjs`）：监听网关 Unix socket，校验 `X-Trim-Isadmin`、
+- **relay 适配层**（`src/app/bin/relay.mjs`）：监听网关 Unix socket，校验 `X-Trim-Isadmin`、
   剥网关前缀、把 Host/Origin 重写为回环地址（通过 dsh 的 browser-trust fence）、代理
   WebSocket、对运行时注入 HTML 的 `/plugins/` URL 做前缀化。
 - **构建期 URL 重写**（`scripts/rewrite-dist.mjs`）：dsh 前端把 `/api`、`/assets`、
@@ -37,7 +37,7 @@
 ## 安装（fnOS 设备）
 
 ```bash
-scp fpk/dsh.fpk nas31:/tmp/
+scp src/dsh.fpk nas31:/tmp/
 ssh nas31 'sudo /usr/local/bin/appcenter-cli install-fpk --volume 1 /tmp/dsh.fpk'
 ssh nas31 'sudo /usr/local/bin/appcenter-cli start dsh'
 ```

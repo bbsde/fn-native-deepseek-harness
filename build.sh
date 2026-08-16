@@ -39,13 +39,13 @@ fi
 # version says which upstream it carries. Wrapper-only re-releases against
 # the same upstream bump the suffix: DSH_WRAPPER_BUILD=1 ./build.sh -> 0.1.0-rc.6.1
 appver="${version}${DSH_WRAPPER_BUILD:+.${DSH_WRAPPER_BUILD}}"
-sed -i "s/^version=.*/version=${appver}/" fpk/manifest
-echo "manifest version -> $(sed -n 's/^version=//p' fpk/manifest)"
+sed -i "s/^version=.*/version=${appver}/" src/manifest
+echo "manifest version -> $(sed -n 's/^version=//p' src/manifest)"
 
 # Same-version rebuilds skip the ~10min remote install when the runtime tree
 # for that version is already staged.
-staged=$(node -p "try{require('./fpk/app/dsh/package.json').dependencies['@deepseek-ai/dsh']}catch{''}" 2>/dev/null || true)
-if [ "$staged" = "$version" ] && [ -f "fpk/app/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
+staged=$(node -p "try{require('./src/app/dsh/package.json').dependencies['@deepseek-ai/dsh']}catch{''}" 2>/dev/null || true)
+if [ "$staged" = "$version" ] && [ -f "src/app/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
   echo "Runtime for ${version} already staged; skipping remote install."
 else
   node scripts/fetch-dsh.mjs
@@ -53,11 +53,11 @@ fi
 
 node scripts/rewrite-dist.mjs
 
-(cd fpk && fnpack build)
+(cd src && fnpack build)
 
-appver=$(sed -n 's/^version=//p' fpk/manifest | head -1 | tr -d '[:space:]')
+appver=$(sed -n 's/^version=//p' src/manifest | head -1 | tr -d '[:space:]')
 mkdir -p dist
 out="dist/dsh_${appver}.fpk"
-cp fpk/dsh.fpk "$out"
+cp src/dsh.fpk "$out"
 printf 'app: %s\ndsh: %s\nbuilt: %s\n' "$appver" "$version" "$(date '+%Y-%m-%d %H:%M:%S')" > "${out}.info.txt"
 echo "Built ${out}"

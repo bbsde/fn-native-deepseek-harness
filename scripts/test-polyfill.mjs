@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import vm from 'node:vm'
 import { randomFillSync } from 'node:crypto'
 
-const src = fs.readFileSync(new URL('../fpk/app/bin/relay.mjs', import.meta.url), 'utf8')
+const src = fs.readFileSync(new URL('../src/app/bin/relay.mjs', import.meta.url), 'utf8')
 const start = src.indexOf('const SECURE_CONTEXT_POLYFILL')
 const end = src.indexOf("</script>'", start)
 if (start === -1 || end === -1) throw new Error('polyfill constant not found in relay.mjs')

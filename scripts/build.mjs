@@ -13,7 +13,7 @@ const run = (command, cwd) => execSync(command, { cwd, stdio: 'inherit' })
 
 // The fpk version mirrors the upstream dsh version (same policy as build.sh).
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
-const manifest = path.join(root, 'fpk', 'manifest')
+const manifest = path.join(root, 'src', 'manifest')
 fs.writeFileSync(manifest, fs.readFileSync(manifest, 'utf8').replace(/^version=.*$/m, `version=${pkg.dshVersion}`))
 
 run('node scripts/fetch-dsh.mjs', root)

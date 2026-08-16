@@ -1,5 +1,5 @@
 dist/
-fpk/*.fpk
-fpk/app/dsh/
+src/*.fpk
+src/app/dsh/
 node_modules/
 runtime.tar.gz

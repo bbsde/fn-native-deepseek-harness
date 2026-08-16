@@ -1,5 +1,5 @@
 /**
- * Installs the pinned @deepseek-ai/dsh release into fpk/app/dsh.
+ * Installs the pinned @deepseek-ai/dsh release into src/app/dsh.
  *
  * dsh has native runtime dependencies (node-pty, koffi) whose Linux-x64
  * binaries are selected/built by install scripts, so the npm install MUST run
@@ -28,7 +28,7 @@ if (typeof version !== 'string' || version === '') {
 
 const host = process.env.DSH_BUILD_HOST ?? 'nas31'
 const remoteDir = `/tmp/dsh-fpk-build/${version}`
-const dest = path.join(root, 'fpk', 'app', 'dsh')
+const dest = path.join(root, 'src', 'app', 'dsh')
 
 const run = (command, args, options = {}) => {
   const result = spawnSync(command, args, { stdio: 'inherit', ...options })
