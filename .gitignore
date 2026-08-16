@@ -1,0 +1,5 @@
+dist/
+fpk/*.fpk
+fpk/app/dsh/
+node_modules/
+runtime.tar.gz

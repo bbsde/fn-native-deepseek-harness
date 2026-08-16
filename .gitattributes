@@ -1,0 +1,7 @@
+* text=auto
+# Files that execute on fnOS/Linux must never carry CRLF
+fpk/cmd/* text eol=lf
+fpk/app/bin/*.mjs text eol=lf
+build.sh text eol=lf
+scripts/*.sh text eol=lf
+scripts/*.mjs text eol=lf

@@ -1,0 +1,151 @@
+#!/bin/bash
+# dsh lifecycle: manages dsh web (loopback) + the gateway relay.
+# dsh refuses non-loopback binding by design; the fnOS unified gateway talks
+# to our relay on a Unix socket, which forwards to 127.0.0.1:3080.
+
+set -u
+
+APPNAME="dsh"
+GATEWAY_PREFIX="/app/${APPNAME}"
+DSH_PORT=3080
+
+DSH_HOME_DIR="${TRIM_PKGVAR}/dsh"
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+DSH_PID_FILE="${TRIM_PKGVAR}/dsh.pid"
+RELAY_PID_FILE="${TRIM_PKGVAR}/relay.pid"
+SOCKET_PATH="${TRIM_APPDEST}/app.sock"
+DSH_BIN="${TRIM_APPDEST}/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
+RELAY_BIN="${TRIM_APPDEST}/bin/relay.mjs"
+
+export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
+
+# New sessions inherit the launch cwd as their project directory, so dsh is
+# started from the shared workspace: agent output lands in a user-visible
+# share instead of the private app tree.
+WORKSPACE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+if [ -z "${WORKSPACE_DIR}" ]; then
+  WORKSPACE_DIR="/var/apps/${APPNAME}/shares/workspace"
+fi
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+check_process() {
+  kill -0 "$1" 2>/dev/null
+}
+
+read_pid() {
+  head -n 1 "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+pid_alive() {
+  local pid
+  pid="$(read_pid "$1")"
+  [ -n "$pid" ] && check_process "$pid"
+}
+
+status_app() {
+  pid_alive "$DSH_PID_FILE" && pid_alive "$RELAY_PID_FILE"
+}
+
+start_app() {
+  if status_app; then
+    return 0
+  fi
+
+  mkdir -p "$DSH_HOME_DIR"
+  if [ ! -d "$WORKSPACE_DIR" ]; then
+    mkdir -p "$WORKSPACE_DIR" 2>/dev/null || true
+  fi
+  if [ ! -f "$DSH_BIN" ]; then
+    log_msg "dsh entry missing: $DSH_BIN"
+    echo "dsh entry missing: $DSH_BIN" > "$TRIM_TEMP_LOGFILE"
+    return 1
+  fi
+
+  if ! pid_alive "$DSH_PID_FILE"; then
+    log_msg "Starting dsh web on 127.0.0.1:$DSH_PORT (cwd $WORKSPACE_DIR)"
+    (
+      cd "$WORKSPACE_DIR" || exit 1
+      # The directory picker defaults to os.homedir(); without HOME the dsh
+      # user's passwd entry (/home/dsh) does not exist on fnOS. Pointing HOME
+      # at the shared workspace also makes "~" land in the user-visible share.
+      # npm/XDG caches are redirected so tooling dotdirs stay out of the share.
+      export HOME="$WORKSPACE_DIR"
+      export XDG_CACHE_HOME="$DSH_HOME_DIR/.xdg/cache"
+      export XDG_CONFIG_HOME="$DSH_HOME_DIR/.xdg/config"
+      export XDG_DATA_HOME="$DSH_HOME_DIR/.xdg/data"
+      export npm_config_cache="$DSH_HOME_DIR/.npm-cache"
+      mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$npm_config_cache" 2>/dev/null || true
+      DSH_HOME="$DSH_HOME_DIR" exec node "$DSH_BIN" web --port "$DSH_PORT"
+    ) >> "$LOG_FILE" 2>&1 &
+    echo $! > "$DSH_PID_FILE"
+  fi
+
+  if ! pid_alive "$RELAY_PID_FILE"; then
+    log_msg "Starting gateway relay on $SOCKET_PATH"
+    rm -f "$SOCKET_PATH"
+    (
+      exec node "$RELAY_BIN" --socket "$SOCKET_PATH" --target "127.0.0.1:$DSH_PORT" --prefix "$GATEWAY_PREFIX"
+    ) >> "$LOG_FILE" 2>&1 &
+    echo $! > "$RELAY_PID_FILE"
+  fi
+
+  local count=0
+  while [ ! -S "$SOCKET_PATH" ] && [ "$count" -lt 30 ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+  if [ ! -S "$SOCKET_PATH" ]; then
+    log_msg "relay socket did not appear within ${count}s"
+    echo "relay socket did not appear; see $LOG_FILE" > "$TRIM_TEMP_LOGFILE"
+    return 1
+  fi
+  return 0
+}
+
+stop_one() {
+  local pid_file="$1" name="$2" pid count
+  pid="$(read_pid "$pid_file")"
+  if [ -z "$pid" ] || ! check_process "$pid"; then
+    rm -f "$pid_file"
+    return 0
+  fi
+  log_msg "Stopping $name (pid $pid)"
+  kill -TERM "$pid" 2>> "$LOG_FILE" || true
+  count=0
+  while check_process "$pid" && [ "$count" -lt 10 ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+  if check_process "$pid"; then
+    kill -KILL "$pid" 2>> "$LOG_FILE" || true
+  fi
+  rm -f "$pid_file"
+}
+
+stop_app() {
+  stop_one "$RELAY_PID_FILE" "relay"
+  stop_one "$DSH_PID_FILE" "dsh web"
+  rm -f "$SOCKET_PATH"
+}
+
+case "$1" in
+  start)
+    start_app
+    ;;
+  stop)
+    stop_app
+    ;;
+  status)
+    if status_app; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  *)
+    echo "Unknown command: $1" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+    ;;
+esac

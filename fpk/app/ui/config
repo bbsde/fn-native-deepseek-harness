@@ -1,0 +1,17 @@
+{
+  ".url": {
+    "dsh.main": {
+      "title": "DSH",
+      "icon": "images/icon_{0}.png",
+      "type": "url",
+      "protocol": "",
+      "gatewayPrefix": "/app/dsh",
+      "gatewaySocket": "app.sock",
+      "url": "/app/dsh",
+      "allUsers": false,
+      "control": {
+        "accessPerm": "readonly"
+      }
+    }
+  }
+}

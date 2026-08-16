@@ -1,0 +1,13 @@
+{
+  "name": "fn-native-deepseek-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fetch": "node scripts/fetch-dsh.mjs",
+    "rewrite": "node scripts/rewrite-dist.mjs",
+    "icons": "python scripts/make-icons.py",
+    "build": "node scripts/build.mjs"
+  },
+  "dshVersion": "0.1.0-rc.6"
+}

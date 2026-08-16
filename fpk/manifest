@@ -1,0 +1,19 @@
+appname=dsh
+version=0.1.0-rc.6.1
+display_name=DSH
+desc=DeepSeek Harness (dsh) AI Agent 框架。通过统一网关在飞牛桌面内使用，仅管理员可访问；Agent 工作目录位于共享目录 dsh/workspace。
+source=thirdparty
+platform=x86
+
+maintainer=fn-native-deepseek-harness contributors
+distributor=fn-native-deepseek-harness contributors
+
+os_min_version=1.1.3100
+
+desktop_uidir=ui
+desktop_applaunchname=dsh.main
+
+install_dep_apps=nodejs_v24
+
+ctl_stop=true
+checkport=false

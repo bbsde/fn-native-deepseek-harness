@@ -1,0 +1,3 @@
+#!/bin/bash
+# Lifecycle hook; no action needed beyond the defaults (cmd/main owns runtime).
+exit 0
