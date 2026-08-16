@@ -13,6 +13,14 @@
  * on the dedicated build NAS (DSH_BUILD_HOST, default "nas31" from
  * ~/.ssh/config), not on this machine. spawnSync/`bash -s` keeps the remote
  * script out of Windows shell quoting.
+ *
+ * When the workspace already lives on a Linux-x64 fnOS box (e.g. the project
+ * was moved onto the NAS itself), set DSH_BUILD_HOST=local to skip SSH
+ * entirely: the install runs in place with the same nodejs_v24 runtime that
+ * the installed app uses, straight into cache/dsh-runtime. The npm cache is
+ * redirected under cache/npm-cache so the build never touches the app's own
+ * DSH_HOME state (npm_config_cache in that environment points at
+ * $DSH_HOME/.npm-cache, which does not exist for a build tree).
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -28,6 +36,7 @@ if (typeof version !== 'string' || version === '') {
 }
 
 const host = process.env.DSH_BUILD_HOST ?? 'nas31'
+const localBuild = host === 'local'
 const remoteDir = `/tmp/dsh-fpk-build/${version}`
 const dest = path.join(root, 'cache', 'dsh-runtime')
 
@@ -39,7 +48,39 @@ const run = (command, args, options = {}) => {
   }
 }
 
-const remoteScript = `
+if (localBuild) {
+  // Same runtime the installed app runs on; fall back to ambient node when
+  // not on fnOS. Node major must match the target (24) so node-pty/koffi
+  // natives are selected for the right ABI.
+  const fnosNode = '/var/apps/nodejs_v24/target'
+  const runtimeBin = fs.existsSync(path.join(fnosNode, 'bin', 'npm')) ? path.join(fnosNode, 'bin') : null
+  const nodeMajor = Number.parseInt(process.versions.node.split('.')[0], 10)
+  if (runtimeBin === null && nodeMajor !== 24) {
+    console.error(`local build needs node major 24 (running ${process.versions.node}) or fnOS nodejs_v24`)
+    process.exit(1)
+  }
+  fs.rmSync(dest, { recursive: true, force: true })
+  fs.mkdirSync(dest, { recursive: true })
+  fs.mkdirSync(path.join(root, 'cache', 'npm-cache'), { recursive: true })
+  fs.writeFileSync(
+    path.join(dest, 'package.json'),
+    JSON.stringify({ name: 'dsh-runtime', private: true, dependencies: { '@deepseek-ai/dsh': version } }),
+  )
+  console.log(`Installing @deepseek-ai/dsh@${version} locally (linux-x64, node ${runtimeBin ? '24 (nodejs_v24)' : process.versions.node}) ...`)
+  const env = {
+    ...process.env,
+    npm_config_cache: path.join(root, 'cache', 'npm-cache'),
+    // node-pty compiles from source (no linux-x64 prebuilds in the tarball);
+    // node-gyp mkdirs its cache under XDG_CACHE_HOME and downloads node headers
+    // into its devdir — both must stay inside the workspace cache on fnOS,
+    // where the ambient XDG paths point at the app's own DSH_HOME state.
+    XDG_CACHE_HOME: path.join(root, 'cache', 'xdg-cache'),
+    npm_config_devdir: path.join(root, 'cache', 'node-gyp'),
+    ...(runtimeBin ? { PATH: `${runtimeBin}:${process.env.PATH}` } : {}),
+  }
+  run('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: dest, env })
+} else {
+  const remoteScript = `
 set -e
 runtime=/var/apps/nodejs_v24/target
 [ -x "\$runtime/bin/npm" ] || { echo 'nodejs_v24 runtime missing on build host' >&2; exit 1; }
@@ -53,20 +94,21 @@ tar czf runtime.tar.gz package.json node_modules
 ls -la runtime.tar.gz
 `
 
-console.log(`Installing @deepseek-ai/dsh@${version} on ${host} (linux-x64, node 24) ...`)
-// stdin must be a pipe for `input` to reach bash -s.
-run('ssh', [host, 'bash -s'], { stdio: ['pipe', 'inherit', 'inherit'], input: remoteScript })
+  console.log(`Installing @deepseek-ai/dsh@${version} on ${host} (linux-x64, node 24) ...`)
+  // stdin must be a pipe for `input` to reach bash -s.
+  run('ssh', [host, 'bash -s'], { stdio: ['pipe', 'inherit', 'inherit'], input: remoteScript })
 
-// npm artifacts carry read-only attributes on Windows; plain rmSync hits EPERM.
-if (fs.existsSync(dest)) {
-  run('bash', ['-c', `rm -rf '${dest.replaceAll("'", "'\\''")}'`])
+  // npm artifacts carry read-only attributes on Windows; plain rmSync hits EPERM.
+  if (fs.existsSync(dest)) {
+    run('bash', ['-c', `rm -rf '${dest.replaceAll("'", "'\\''")}'`])
+  }
+  fs.mkdirSync(dest, { recursive: true })
+  console.log('Fetching runtime back ...')
+  run('scp', ['-q', `${host}:${remoteDir}/runtime.tar.gz`, path.join(dest, 'runtime.tar.gz')])
+  run('tar', ['xzf', 'runtime.tar.gz'], { cwd: dest })
+  fs.rmSync(path.join(dest, 'runtime.tar.gz'))
+  run('ssh', [host, `rm -rf '${remoteDir}'`])
 }
-fs.mkdirSync(dest, { recursive: true })
-console.log('Fetching runtime back ...')
-run('scp', ['-q', `${host}:${remoteDir}/runtime.tar.gz`, path.join(dest, 'runtime.tar.gz')])
-run('tar', ['xzf', 'runtime.tar.gz'], { cwd: dest })
-fs.rmSync(path.join(dest, 'runtime.tar.gz'))
-run('ssh', [host, `rm -rf '${remoteDir}'`])
 
 const entry = path.join(dest, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
 if (!fs.existsSync(entry)) {

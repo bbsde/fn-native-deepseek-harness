@@ -69,6 +69,12 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
   `dshVersion`（钉版是唯一上游版本来源，**精确钉死**，rc 阶段破坏性变更多）。
   同版本重复构建走快速路径（跳过远程安装与重写——rewrite-dist 带幂等预检）；换新版本自动
   走全流程，**若上游打包方式变化，重写门禁会让构建大声失败**，此时按门禁报错更新规则集再重跑。
+- **工作区就在 fnOS 机器上时（HOME-NAS：/vol3/1000/Projects/fn-native-deepseek-harness）**：
+  `DSH_BUILD_HOST=local DSH_WRAPPER_BUILD=1 ./build.sh 0.1.0-rc.6`，fetch 直接在本机
+  nodejs_v24 下装进 `cache/`，不再走 SSH。npm 缓存重定向到 `cache/npm-cache`（本机
+  shell 的 `npm_config_cache` 指向 `$DSH_HOME/.npm-cache`，构建树必须绕开）。注意：
+  在这台机器上装的 dsh 里开的会话，其工作区若就是本仓库，**升级安装会杀掉会话**——
+  先出包、择机装，装完开新会话接续；`sudo appcenter-cli` 只能由管理员在宿主 shell 执行。
 - **npm install 必须在 Linux x64 上执行**：dsh 有原生依赖 node-pty（需编译或预编译产物）
   和 koffi（install 脚本装原生模块），Windows/`--ignore-scripts` 装出的树在 fnOS 上必崩
   （症状：plugin tree failed to load / pty.node not found / Koffi missing）。
