@@ -17,6 +17,27 @@ if (!fs.existsSync(path.join(staged, 'node_modules', '@deepseek-ai', 'dsh', 'lib
   console.error(`staged runtime missing (run fetch + rewrite first): ${staged}`)
   process.exit(1)
 }
+
+// The harness's glob/grep tools spawn a vendored ripgrep
+// (@vscode/ripgrep-<platform>/bin/rg) — the only file in the tree that must
+// carry an exec bit to work (native .node/.so files load via dlopen, which
+// needs read only). A staging chain that drops the exec bit (e.g. the old
+// Windows/MSYS tar round-trip) therefore ships a runtime where everything
+// runs except glob/grep, which fail with "ripgrep launch failed" (EACCES at
+// spawn). Force 0o755 here so the tar always records an executable rg, and
+// verify it is a Linux ELF like fetch does for pty.node.
+const rgBin = path.join(staged, 'node_modules', '@vscode', 'ripgrep-linux-x64', 'bin', 'rg')
+if (!fs.existsSync(rgBin)) {
+  console.error(`vendored ripgrep missing from staged tree: ${rgBin}`)
+  process.exit(1)
+}
+const rgMagic = fs.readFileSync(rgBin).subarray(0, 4)
+if (!(rgMagic[0] === 0x7f && rgMagic[1] === 0x45 && rgMagic[2] === 0x4c && rgMagic[3] === 0x46)) {
+  console.error(`vendored ripgrep is not a Linux ELF: ${rgBin}`)
+  process.exit(1)
+}
+fs.chmodSync(rgBin, 0o755)
+
 fs.rmSync(out, { force: true })
 fs.mkdirSync(path.dirname(out), { recursive: true })
 

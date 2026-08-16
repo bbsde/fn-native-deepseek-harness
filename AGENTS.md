@@ -87,6 +87,11 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
   （`"/api`、`"/assets/`、`"/plugins/`、反引号形式、webmanifest 的 start_url/scope/id）
   改写为网关前缀。带校验门禁：模式消失/计数异常 → 构建失败。
   **升级 dshVersion 后重写失败时，先检查上游打包方式变化，更新规则集，再重新验证。**
+- glob/grep 工具不用系统 `rg`，而是 spawn 上游 vendor 的
+  `node_modules/@vscode/ripgrep-linux-x64/bin/rg`——树里唯一必须带执行位的文件
+  （.node/.so 走 dlopen 只要读权限）。旧 Windows/MSYS tar 往返构建曾丢过该执行位：
+  装出的应用一切正常、唯独 glob/grep 报 `ripgrep launch failed`（spawn EACCES）。
+  `pack-runtime.mjs` 现已强制 chmod 0o755 并校验 ELF；本机构建天然规避此问题。
 
 ## 开发测试生命周期（平台：nas31）
 
