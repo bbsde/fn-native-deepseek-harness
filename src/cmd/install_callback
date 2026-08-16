@@ -1,3 +1,20 @@
 #!/bin/bash
-# Lifecycle hook; no action needed beyond the defaults (cmd/main owns runtime).
+# Extracts the single-file dsh runtime (33k files as one tarball) into
+# TRIM_PKGVAR/runtime. Shipping the tree as individual files made fnOS
+# installation take minutes (per-file verify + ACL); one tarball installs in
+# seconds and extracts here in well under a minute.
+set -e
+
+RUNTIME_TAR="${TRIM_APPDEST}/runtime.tar.gz"
+RUNTIME_DIR="${TRIM_PKGVAR}/runtime"
+
+if [ ! -f "$RUNTIME_TAR" ]; then
+  echo "runtime tar missing: $RUNTIME_TAR" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+  exit 1
+fi
+
+rm -rf "$RUNTIME_DIR"
+mkdir -p "$RUNTIME_DIR"
+tar xzf "$RUNTIME_TAR" -C "$RUNTIME_DIR"
+
 exit 0

@@ -14,7 +14,11 @@ LOG_FILE="${TRIM_PKGVAR}/app.log"
 DSH_PID_FILE="${TRIM_PKGVAR}/dsh.pid"
 RELAY_PID_FILE="${TRIM_PKGVAR}/relay.pid"
 SOCKET_PATH="${TRIM_APPDEST}/app.sock"
-DSH_BIN="${TRIM_APPDEST}/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
+# The 33k-file dsh runtime ships as a single runtime.tar.gz and is extracted
+# here by cmd/install_callback — per-file extraction through the fnOS
+# installer's ACL ceremony was what made installation take minutes.
+RUNTIME_DIR="${TRIM_PKGVAR}/runtime"
+DSH_BIN="${RUNTIME_DIR}/node_modules/@deepseek-ai/dsh/lib/bin.js"
 RELAY_BIN="${TRIM_APPDEST}/bin/relay.mjs"
 
 export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
@@ -60,7 +64,7 @@ start_app() {
   fi
   if [ ! -f "$DSH_BIN" ]; then
     log_msg "dsh entry missing: $DSH_BIN"
-    echo "dsh entry missing: $DSH_BIN" > "$TRIM_TEMP_LOGFILE"
+    echo "dsh runtime not extracted; reinstall the app (see $LOG_FILE)" > "$TRIM_TEMP_LOGFILE"
     return 1
   fi
 

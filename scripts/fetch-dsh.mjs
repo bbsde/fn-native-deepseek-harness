@@ -1,12 +1,13 @@
 /**
- * Installs the pinned @deepseek-ai/dsh release into src/app/dsh.
+ * Installs the pinned @deepseek-ai/dsh release into cache/dsh-runtime.
  *
  * dsh has native runtime dependencies (node-pty, koffi) whose Linux-x64
  * binaries are selected/built by install scripts, so the npm install MUST run
  * on a Linux-x64 host that shares the target Node major (nodejs_v24 on the
  * NAS). This script performs the install remotely on the build NAS over SSH
  * and ships the tree back as a tarball, which also preserves symlinks on the
- * Windows dev machine.
+ * Windows dev machine. The staged tree is later packed into a single
+ * runtime.tar.gz by scripts/pack-runtime.mjs.
  *
  * The remote install runs dependency install scripts by necessity; it happens
  * on the dedicated build NAS (DSH_BUILD_HOST, default "nas31" from
@@ -28,7 +29,7 @@ if (typeof version !== 'string' || version === '') {
 
 const host = process.env.DSH_BUILD_HOST ?? 'nas31'
 const remoteDir = `/tmp/dsh-fpk-build/${version}`
-const dest = path.join(root, 'src', 'app', 'dsh')
+const dest = path.join(root, 'cache', 'dsh-runtime')
 
 const run = (command, args, options = {}) => {
   const result = spawnSync(command, args, { stdio: 'inherit', ...options })

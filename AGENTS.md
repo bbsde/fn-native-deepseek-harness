@@ -28,6 +28,9 @@
 
 - `DSH_HOME=$TRIM_PKGVAR/dsh`（即 `/vol1/@appdata/dsh/dsh`）：`.credentials.yaml`
   （上游强制 owner-only 权限位，放共享目录会拒绝启动）、profiles/（可执行插件代码）、会话与设置。
+- dsh 运行时整树以单文件 `src/app/runtime.tar.gz` 进 fpk（33k 文件打成 1 个，安装秒级），
+  `cmd/install_callback`/`upgrade_callback` 在安装/升级时解压到 `$TRIM_PKGVAR/runtime`，
+  cmd/main 从那里启动 dsh（解压失败的报错会指向重装）。
 - 共享目录 `dsh/workspace`（data-share 声明，实际在 `/vol1/@appshare/dsh/workspace`）：
   agent 工作目录。cmd/main 启动 dsh 前 `cd` 进去，新会话 cwd 默认取 `process.getcwd()`，
   产出文件天然落在共享区，文件管理器可见。
@@ -43,7 +46,9 @@
 
 ```
 src/                 # fnpack 打包根（manifest、config/、cmd/、app/bin/relay.mjs、app/ui/）
-src/app/dsh/         # 构建期生成：Linux x64 的 @deepseek-ai/dsh node_modules（勿手改，勿提交）
+cache/dsh-runtime/   # 构建缓存：Linux x64 的 dsh node_modules（勿手改，勿提交）
+src/app/runtime.tar.gz  # 构建期生成：runtime 整树单文件 tar（33k 文件打包成 1 个，
+                      #   安装秒级；cmd/install_callback 解压到 $TRIM_PKGVAR/runtime）
 scripts/             # fetch-dsh / rewrite-dist / build / 本地与真机测试脚本
 package.json         # dshVersion 钉死上游版本
 ```
@@ -126,7 +131,7 @@ curl 检查要点：无 `X-Trim-Isadmin` → 403；带 admin + 任意 Host → 2
 
 - relay 的 `--test-allow-anonymous` **只允许本地验证**，cmd/main 与任何生产调用不得出现。
 - 不改上游源码；所有适配都在 relay 与构建期重写里。
-- 不要把 `src/app/dsh/node_modules` 提交进仓库（构建期生成）。
+- 不要把 `cache/`（构建缓存）和 `src/app/runtime.tar.gz`（构建产物）提交进仓库。
 - Git Bash 下传 `/app/...` 之类参数给 node 时加 `MSYS_NO_PATHCONV=1`，否则参数被路径转换污染；
   node 脚本里远程命令一律走 `spawnSync('ssh', [host,'bash -s'], {input})`，别过 Windows shell。
 - 上游 `.credentials.yaml` 强制 owner-only 权限位——DSH_HOME 永远放 `TRIM_PKGVAR`。

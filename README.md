@@ -31,8 +31,10 @@
 
 `build.sh` 会把所用的上游版本钉回 `package.json`（`dshVersion`），并**将 fpk 版本镜像为
 上游版本**（应用中心里看到的版本即所带 dsh 版本；同一上游的纯封装修复重新发布时手动在
-尾号加 `.N`）。构建自动完成：远程 Linux 安装（node-pty/koffi 原生模块必须在 Linux x64
-上装）→ 前端 URL 前缀重写（带校验门禁）→ fnpack 打包。同版本重复构建走快速路径。
+尾号加 `.N`）。构建自动完成：远程 Linux 安装（node-pty/koffi 原生模块必须在 Linux x64 上装）→
+前端 URL 前缀重写（带校验门禁）→ runtime 整树打成单文件 tar → fnpack 打包。
+单文件 tar 让安装从分钟级降到秒级（33k 个文件逐个过 fnOS 的校验+ACL 太慢），
+tar 在安装回调里解压到应用数据目录。同版本重复构建走快速路径。
 
 ## 安装（fnOS 设备）
 

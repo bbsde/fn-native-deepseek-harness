@@ -3,3 +3,4 @@ src/*.fpk
 src/app/dsh/
 node_modules/
 runtime.tar.gz
+cache/

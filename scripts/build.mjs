@@ -1,7 +1,8 @@
 /**
  * Pinned-version build path (no npm lookup, no dist copy): stamps the fpk
  * version from dshVersion, installs the runtime remotely, rewrites the dist,
- * and packs with fnpack. ./build.sh is the primary entry.
+ * packs the runtime tarball, and packs with fnpack. ./build.sh is the
+ * primary entry.
  */
 import { execSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -18,4 +19,5 @@ fs.writeFileSync(manifest, fs.readFileSync(manifest, 'utf8').replace(/^version=.
 
 run('node scripts/fetch-dsh.mjs', root)
 run('node scripts/rewrite-dist.mjs', root)
-run('fnpack build', path.join(root, 'fpk'))
+run('node scripts/pack-runtime.mjs', root)
+run('fnpack build', path.join(root, 'src'))

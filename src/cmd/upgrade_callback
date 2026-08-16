@@ -1,3 +1,17 @@
 #!/bin/bash
-# Lifecycle hook; no action needed beyond the defaults (cmd/main owns runtime).
+# Upgrades carry a fresh runtime.tar.gz; re-extract over the old tree.
+set -e
+
+RUNTIME_TAR="${TRIM_APPDEST}/runtime.tar.gz"
+RUNTIME_DIR="${TRIM_PKGVAR}/runtime"
+
+if [ ! -f "$RUNTIME_TAR" ]; then
+  echo "runtime tar missing: $RUNTIME_TAR" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+  exit 1
+fi
+
+rm -rf "$RUNTIME_DIR"
+mkdir -p "$RUNTIME_DIR"
+tar xzf "$RUNTIME_TAR" -C "$RUNTIME_DIR"
+
 exit 0
