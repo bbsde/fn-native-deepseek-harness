@@ -1,0 +1,62 @@
+# Reusable dual-architecture fpk build. Called by release.yml (manual tag)
+# and auto-follow.yml (scheduled upstream follow). Produces fpk artifacts;
+# publishing is the caller's job.
+name: build-fpk
+
+on:
+  workflow_call:
+    inputs:
+      appver:
+        required: true
+        type: string
+      upstream:
+        required: true
+        type: string
+
+env:
+  FNPACK_VERSION: '1.2.3'
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            fnpack_platform: linux-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            fnpack_platform: linux-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install native toolchain (node-pty compiles from source)
+        run: sudo apt-get update && sudo apt-get install -y g++ make python3
+
+      - name: Install fnpack
+        run: |
+          curl -fsSL -o /usr/local/bin/fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-${{ matrix.fnpack_platform }}"
+          chmod +x /usr/local/bin/fnpack
+
+      - name: Build fpk (${{ matrix.arch }})
+        env:
+          DSH_ARCHS: ${{ matrix.arch }}
+          DSH_APPVER: ${{ inputs.appver }}
+          DSH_UPSTREAM: ${{ inputs.upstream }}
+        run: ./build.sh "$DSH_UPSTREAM"
+
+      - name: Upload fpk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-fpk-${{ matrix.arch }}
+          path: dist/*.fpk
+          if-no-files-found: error

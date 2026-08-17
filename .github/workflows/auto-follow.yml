@@ -1,0 +1,96 @@
+# Scheduled upstream follow: auto-release when @deepseek-ai/dsh publishes a
+# new version on npm.
+#
+# Runs daily. Compares npm's latest with the pinned dshVersion; when a newer
+# upstream exists, builds both arches FIRST and only then (on success) pushes
+# a bump commit + tag for the record and creates the Release with the fpks.
+# If the build breaks (rc-stage upstream churn can change bundle shapes and
+# trip the rewrite gate), nothing is pushed or tagged — main stays clean and
+# the next run retries.
+#
+# No PAT needed: everything (commit, tag, Release) uses the workflow's own
+# GITHUB_TOKEN. The GITHUB_TOKEN cannot trigger other workflows, which is
+# fine here because building and publishing happen in this same workflow.
+name: auto-follow
+
+on:
+  schedule:
+    - cron: '17 21 * * *'   # 21:17 UTC daily = 05:17 Asia/Shanghai, off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-follow
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check upstream
+    runs-on: ubuntu-latest
+    outputs:
+      latest: ${{ steps.cmp.outputs.latest }}
+      pinned: ${{ steps.cmp.outputs.pinned }}
+      changed: ${{ steps.cmp.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare npm latest with pinned dshVersion
+        id: cmp
+        run: |
+          latest="$(npm view @deepseek-ai/dsh version)"
+          pinned="$(node -p "require('./package.json').dshVersion")"
+          changed=no
+          if [ "$latest" != "$pinned" ]; then
+            changed=yes
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "npm latest: $latest / pinned: $pinned / changed: $changed"
+
+  build:
+    name: build new upstream
+    needs: check
+    if: needs.check.outputs.changed == 'yes'
+    uses: ./.github/workflows/build-fpk.yml
+    with:
+      appver: ${{ needs.check.outputs.latest }}
+      upstream: ${{ needs.check.outputs.latest }}
+
+  release:
+    name: bump, tag, publish
+    needs: [check, build]
+    if: needs.check.outputs.changed == 'yes'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git identity
+        run: |
+          git config user.name "dsh-release-bot"
+          git config user.email "actions@github.com"
+
+      - name: Bump pinned dshVersion and push tag
+        run: |
+          ver="${{ needs.check.outputs.latest }}"
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.dshVersion='${ver}';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+          git add package.json
+          git commit -m "chore: follow upstream @deepseek-ai/dsh@${ver} (auto)"
+          git tag "v${ver}"
+          git push origin HEAD:main --follow-tags
+
+      - name: Download fpk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          pattern: dsh-fpk-*
+          merge-multiple: true
+
+      - name: Create release with fpks
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check.outputs.latest }}
+          files: dist-all/*.fpk
+          generate_release_notes: true
