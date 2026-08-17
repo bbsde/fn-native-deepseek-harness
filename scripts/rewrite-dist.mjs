@@ -23,7 +23,8 @@ import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const prefix = process.env.GATEWAY_PREFIX ?? '/app/dsh'
-const runtime = path.join(root, 'cache', 'dsh-runtime', 'node_modules')
+const arch = process.env.DSH_ARCH === 'arm64' ? 'arm64' : 'x86_64'
+const runtime = path.join(root, 'cache', `dsh-runtime-${arch}`, 'node_modules')
 const dist = path.join(runtime, '@deepseek-ai', 'dsh-web-frontend', 'dist')
 
 if (!fs.existsSync(path.join(dist, 'index.html'))) {

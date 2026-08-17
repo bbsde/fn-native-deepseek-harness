@@ -46,7 +46,8 @@
 
 ```
 src/                 # fnpack 打包根（manifest、config/、cmd/、app/bin/relay.mjs、app/ui/）
-cache/dsh-runtime/   # 构建缓存：Linux x64 的 dsh node_modules（勿手改，勿提交）
+cache/dsh-runtime-x86_64/  # 构建缓存：x86_64 的 dsh node_modules（勿手改，勿提交）
+cache/dsh-runtime-arm64/    # 构建缓存：arm64 的 dsh node_modules（QEMU 容器内编译）
 src/app/runtime.tar.gz  # 构建期生成：runtime 整树单文件 tar（33k 文件打包成 1 个，
                       #   安装秒级；cmd/install_callback 解压到 $TRIM_PKGVAR/runtime）
 scripts/             # fetch-dsh / rewrite-dist / build / 本地与真机测试脚本
@@ -84,7 +85,30 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
   `fetch-dsh.mjs` 通过 SSH 在构建机（`DSH_BUILD_HOST`，默认 nas31）上用设备同款
   nodejs_v24 运行时安装，tar 回传（保符号链接），并校验 pty.node 是 Linux ELF。
 - nas31 需要一次性装好工具链：`sudo apt-get install -y g++ make python3`（node-pty 编译用）。
-- `platform=x86`：原生模块是 linux-x64 的；ARM 设备需要另跑一套 ARM 构建。
+- **fnOS `platform` 字段取值**：`x86`（仅 x86 设备）/ `arm`（仅 ARM 设备）/ `all`（同时支持，但仅当包内不含架构特定二进制时）。本应用内含架构相关的原生模块（node-pty/koffi/ripgrep 都是特定架构的 .node/.so），**不能用 `all`**——必须出两个独立包（`platform=x86` 与 `platform=arm`），分别安装到对应架构设备。
+
+### 双架构一键构建（当前主机环境）
+
+`build.sh` 默认一次产出 **两个 fpk**：`dist/dsh_<ver>_x86.fpk`（platform=x86）和
+`dist/dsh_<ver>_arm.fpk`（platform=arm）。用 `DSH_ARCHS="x86_64 arm64"`（默认）控制，
+可只构建子集，如 `DSH_ARCHS=arm64 ./build.sh`。
+
+- 每个架构独立 staging：`cache/dsh-runtime-x86_64/` 与 `cache/dsh-runtime-arm64/`，
+  各自产出 `src/app/runtime-x86_64.tar.gz` / `runtime-arm64.tar.gz`；fnpack 前复制成
+  `src/app/runtime.tar.gz`（install_callback 仍解这个固定名，包内已是对应的架构）。
+- **x86_64**：本机 `nodejs_v24` 直接 `npm install`（`DSH_BUILD_HOST=local` 逻辑，已默认）。
+- **arm64**：本机 x86 上用 QEMU 用户态模拟跑 `arm64v8/node:24` 容器编译（node-pty 在
+  linux-arm64 无预编译，必须容器内 g++ 源码编译）。前提：
+  1. binfmt_misc 注册了 `qemu-aarch64`（装 `qemu-user-static` 包的 systemd 服务会做）；
+  2. 容器 `--net=host` 并通过宿主 HTTP 代理拉 apt/npm——代理地址由 `DSH_PROXY`
+     （默认 `http://127.0.0.1:7890`）指定，需宿主机梯子监听在 127.0.0.1（容器
+     `--net=host` 下 localhost 即宿主 localhost）；arm64 镜像需能经梯子拉取
+     （如 `arm64v8/node:24`，可改 `DSH_ARM_IMAGE`）。
+  - QEMU 下 npm 依赖树解析极慢（500+ 包可能数分钟纯 CPU 0 落盘），属已知瓶颈，
+    编译本身没问题（单包 node-pty 约 52s 编出 arm64 pty.node，已验证）。
+- `fetch-dsh.mjs` / `rewrite-dist.mjs` / `pack-runtime.mjs` 均读 `DSH_ARCH`
+  （`x86_64` 默认 / `arm64`）选择 staging 目录、ripgrep 平台包名（`ripgrep-linux-x64`
+  / `ripgrep-linux-arm64`）和 pty 校验路径（`linux-x64` / `linux-arm64`）。
 - `rewrite-dist.mjs` 是对上游产物的**构建期补丁**（非源码 fork）：把 dist 外壳和 39 个
   `dsh.client` 插件包（经 package.json exports["./client"] 发现）中的根绝对 URL
   （`"/api`、`"/assets/`、`"/plugins/`、反引号形式、webmanifest 的 start_url/scope/id）
