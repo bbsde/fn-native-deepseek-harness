@@ -89,7 +89,7 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
 
 ### 双架构构建（GitHub Actions 为主路径）
 
-**主路径是 CI**：`.github/workflows/build.yml` 在 push/master 和手动触发时跑双 runner 矩阵
+**主路径是 CI**：`.github/workflows/build.yml` 在 push/main 和手动触发时跑双 runner 矩阵
 ——`ubuntu-latest`（x86_64）+ `ubuntu-24.04-arm`（**原生 arm64 runner**），各自下载对应
 架构的 fnpack（官方 CDN `static2.fnnas.com/fnpack/fnpack-<ver>-linux-amd64|linux-arm`），
 跑 `DSH_ARCHS=<arch> ./build.sh` 产出 fpk 并上传 artifact；**打 `v*` tag 自动建 Release
