@@ -99,8 +99,12 @@ for arch in $DSH_ARCHS; do
   DSH_ARCH="$arch" node scripts/rewrite-dist.mjs
   DSH_ARCH="$arch" node scripts/pack-runtime.mjs
 
-  # Place this arch's runtime tar where install_callback expects it.
-  cp "src/app/runtime-${arch}.tar.gz" "src/app/runtime.tar.gz"
+  # Place this arch's runtime tar where install_callback expects it. fnpack
+  # packs the whole src/app tree, so keep ONLY runtime.tar.gz in there — a
+  # stray arch tar would ship 60+ MB of dead weight inside the fpk (this bit
+  # us once: both arch tars ended up inside both fpks).
+  rm -f src/app/runtime.tar.gz src/app/runtime-*.tar.gz
+  cp "cache/runtime-${arch}.tar.gz" "src/app/runtime.tar.gz"
 
   # Stamp the manifest with this arch's platform, then fnpack.
   sed -i "s/^platform=.*/platform=${pkg_platform}/" src/manifest

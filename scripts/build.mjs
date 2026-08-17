@@ -31,8 +31,13 @@ for (const arch of archs) {
   run(`DSH_ARCH=${arch} node scripts/fetch-dsh.mjs`, root)
   run(`DSH_ARCH=${arch} node scripts/rewrite-dist.mjs`, root)
   run(`DSH_ARCH=${arch} node scripts/pack-runtime.mjs`, root)
+  // Keep only runtime.tar.gz inside src/app (fnpack packs the whole tree;
+  // stray arch tars would bloat every fpk by 60+ MB).
+  for (const stale of fs.readdirSync(path.join(root, 'src', 'app'))) {
+    if (/^runtime(-.*)?\.tar\.gz$/.test(stale)) fs.rmSync(path.join(root, 'src', 'app', stale))
+  }
   fs.copyFileSync(
-    path.join(root, 'src', 'app', `runtime-${arch}.tar.gz`),
+    path.join(root, 'cache', `runtime-${arch}.tar.gz`),
     path.join(root, 'src', 'app', 'runtime.tar.gz'),
   )
   fs.writeFileSync(

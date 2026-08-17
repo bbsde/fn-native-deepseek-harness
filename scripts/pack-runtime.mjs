@@ -17,7 +17,11 @@ const arch = process.env.DSH_ARCH === 'arm64' ? 'arm64' : 'x86_64'
 const rgPlatform = arch === 'arm64' ? 'ripgrep-linux-arm64' : 'ripgrep-linux-x64'
 
 const staged = path.join(root, 'cache', `dsh-runtime-${arch}`)
-const out = path.join(root, 'src', 'app', `runtime-${arch}.tar.gz`)
+// Output lands in cache/ (gitignored, never inside src/): fnpack packs the
+// whole src/app tree, so a stray arch tar there would ship 60+ MB of dead
+// weight inside the fpk. build.sh copies the right arch into
+// src/app/runtime.tar.gz right before fnpack.
+const out = path.join(root, 'cache', `runtime-${arch}.tar.gz`)
 
 if (!fs.existsSync(path.join(staged, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))) {
   console.error(`staged runtime missing (run fetch + rewrite first): ${staged}`)
@@ -59,7 +63,7 @@ fs.mkdirSync(path.dirname(out), { recursive: true })
 // so absolute Windows paths must stay out of the argument list.
 const tar = spawnSync(
   'tar',
-  ['czf', `src/app/runtime-${arch}.tar.gz`, '-C', `cache/dsh-runtime-${arch}`, 'package.json', 'node_modules'],
+  ['czf', `cache/runtime-${arch}.tar.gz`, '-C', `cache/dsh-runtime-${arch}`, 'package.json', 'node_modules'],
   { cwd: root, stdio: 'inherit' },
 )
 if (tar.status !== 0) {
