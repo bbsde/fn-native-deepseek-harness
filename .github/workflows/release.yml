@@ -1,0 +1,124 @@
+# Tag-driven dual-architecture fpk release.
+#
+# The git tag is the single version source — nothing is edited by hand:
+#   git tag v0.1.0-rc.6.2 && git push --tags
+#     -> builds x86_64 + arm64 fpks on native runners
+#     -> creates a GitHub Release with both fpks attached
+#
+# Tag format: v<upstream-dsh-version>[.<wrapper-revision>], e.g.
+#   v0.1.0-rc.6.2  -> appver 0.1.0-rc.6.2, upstream dshVersion 0.1.0-rc.6
+#   v0.1.0-rc.7    -> appver 0.1.0-rc.7,   upstream dshVersion 0.1.0-rc.7
+# The upstream part is resolved by build.sh's DSH_UPSTREAM; this workflow
+# derives it by stripping one trailing ".<rev>" segment ONLY when the pinned
+# package.json dshVersion differs from the tag (first release of an upstream
+# needs no wrapper revision; re-releases of the same upstream carry one).
+#
+# Pushes to main do NOT build (saves runner minutes); workflow_dispatch
+# remains for manual runs with explicit versions.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      appver:
+        description: 'full fpk version (e.g. 0.1.0-rc.6.3)'
+        required: true
+      upstream:
+        description: 'upstream dsh version (e.g. 0.1.0-rc.6)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  FNPACK_VERSION: '1.2.3'
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            fnpack_platform: linux-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            fnpack_platform: linux-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install native toolchain (node-pty compiles from source)
+        run: sudo apt-get update && sudo apt-get install -y g++ make python3
+
+      - name: Install fnpack
+        run: |
+          curl -fsSL -o /usr/local/bin/fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-${{ matrix.fnpack_platform }}"
+          chmod +x /usr/local/bin/fnpack
+
+      - name: Resolve versions from tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            appver='${{ github.event.inputs.appver }}'
+            upstream='${{ github.event.inputs.upstream }}'
+          else
+            appver="${GITHUB_REF_NAME#v}"
+            pinned="$(node -p "require('./package.json').dshVersion")"
+            no_last="${appver%.*}"
+            if [ "$no_last" != "$appver" ] && [ "$no_last" = "$pinned" ]; then
+              upstream="$no_last"
+            else
+              upstream="$appver"
+            fi
+          fi
+          echo "appver=$appver" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "resolved: appver=$appver upstream=$upstream"
+
+      - name: Build fpk (${{ matrix.arch }})
+        env:
+          DSH_ARCHS: ${{ matrix.arch }}
+          DSH_APPVER: ${{ steps.ver.outputs.appver }}
+          DSH_UPSTREAM: ${{ steps.ver.outputs.upstream }}
+        run: ./build.sh "$DSH_UPSTREAM"
+
+      - name: Upload fpk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-fpk-${{ matrix.arch }}
+          path: |
+            dist/*.fpk
+            dist/*.fpk.info.txt
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all fpk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          pattern: dsh-fpk-*
+          merge-multiple: true
+
+      - name: Create release with fpks
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-all/*.fpk
+            dist-all/*.fpk.info.txt
+          generate_release_notes: true

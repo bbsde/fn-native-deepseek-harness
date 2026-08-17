@@ -17,7 +17,14 @@ if [ $# -gt 1 ]; then
   exit 1
 fi
 
-if [ $# -eq 1 ]; then
+# DSH_APPVER + DSH_UPSTREAM (both from the CI git tag) override the
+# positional/DSH_WRAPPER_BUILD version logic: DSH_UPSTREAM is the upstream
+# dsh version (e.g. 0.1.0-rc.6), DSH_APPVER the full fpk version
+# (e.g. 0.1.0-rc.6.2). Tag = single version source, nothing to edit by hand.
+if [ -n "${DSH_APPVER:-}" ]; then
+  version="${DSH_UPSTREAM:?DSH_UPSTREAM is required when DSH_APPVER is set}"
+  echo "DSH_APPVER=${DSH_APPVER} (upstream dshVersion=${version})"
+elif [ $# -eq 1 ]; then
   version=$1
 else
   echo "Resolving latest @deepseek-ai/dsh from npm ..."
@@ -38,7 +45,11 @@ fi
 # The fpk version mirrors the upstream dsh version so the installed app
 # version says which upstream it carries. Wrapper-only re-releases against
 # the same upstream bump the suffix: DSH_WRAPPER_BUILD=1 ./build.sh -> 0.1.0-rc.6.1
-appver="${version}${DSH_WRAPPER_BUILD:+.${DSH_WRAPPER_BUILD}}"
+if [ -n "${DSH_APPVER:-}" ]; then
+  appver="${DSH_APPVER}"
+else
+  appver="${version}${DSH_WRAPPER_BUILD:+.${DSH_WRAPPER_BUILD}}"
+fi
 sed -i "s/^version=.*/version=${appver}/" src/manifest
 echo "manifest version -> $(sed -n 's/^version=//p' src/manifest)"
 

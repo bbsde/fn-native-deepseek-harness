@@ -87,19 +87,29 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
 - nas31 需要一次性装好工具链：`sudo apt-get install -y g++ make python3`（node-pty 编译用）。
 - **fnOS `platform` 字段取值**：`x86`（仅 x86 设备）/ `arm`（仅 ARM 设备）/ `all`（同时支持，但仅当包内不含架构特定二进制时）。本应用内含架构相关的原生模块（node-pty/koffi/ripgrep 都是特定架构的 .node/.so），**不能用 `all`**——必须出两个独立包（`platform=x86` 与 `platform=arm`），分别安装到对应架构设备。
 
-### 双架构构建（GitHub Actions 为主路径）
+### 双架构发布（GitHub Actions，tag 驱动）
 
-**主路径是 CI**：`.github/workflows/build.yml` 在 push/main 和手动触发时跑双 runner 矩阵
-——`ubuntu-latest`（x86_64）+ `ubuntu-24.04-arm`（**原生 arm64 runner**），各自下载对应
-架构的 fnpack（官方 CDN `static2.fnnas.com/fnpack/fnpack-<ver>-linux-amd64|linux-arm`），
-跑 `DSH_ARCHS=<arch> ./build.sh` 产出 fpk 并上传 artifact；**打 `v*` tag 自动建 Release
-附双 fpk**。原生 runner 上 npm 自然解析 arm64 的 optional deps（ripgrep），无 QEMU/代理/
-镜像配置，单包构建约 5 分钟。仓库托管在 GitHub（`bbsde/fn-native-deepseek-harness`），
-推送用 `$DSH_HOME/.ssh/id_ed25519_gitee`（GitHub Deploy key，Allow write）。
+**发布流程全自动，git tag 是唯一版本来源**：打 tag 即构建+发 Release，无需手动跑
+build 或改版本文件：
 
-**本地构建仅 x86**（`DSH_ARCHS=x86_64`，默认走本机 nodejs_v24）。本地 x86 主机上请求
-arm64 会明确报错指向 CI——曾经的 QEMU 容器模拟路径（约 40 分钟/次 + 宿主代理依赖）已移除。
-若有原生 arm64 Linux 机器，`DSH_ARCH=arm64 DSH_BUILD_HOST=local` 可直接本机构建。
+```bash
+git tag v0.1.0-rc.6.3 && git push --tags
+# -> CI 双 runner 矩阵构建（ubuntu-latest x86_64 + ubuntu-24.04-arm 原生 arm64）
+# -> 自动建 GitHub Release 附 dsh_<ver>_x86.fpk + dsh_<ver>_arm.fpk
+```
+
+- **tag 格式** `v<上游版本>[.<封装修订>]`：`v0.1.0-rc.7`（新上游首发）或
+  `v0.1.0-rc.6.3`（同一上游的封装修订）。CI 解析规则：去掉 v 得 appver；若
+  `appver` 去掉最后一段后等于 package.json 钉住的 dshVersion，则那段就是封装修订，
+  上游版本取剩余部分，否则整个 appver 即上游版本。解析结果经 `DSH_APPVER`/
+  `DSH_UPSTREAM` 传给 build.sh（无需手改 package.json/manifest——CI 构建树里改写）。
+- **push 到 main 不构建**（省 runner 额度）；`workflow_dispatch` 保留手动触发
+  （显式输入 appver/upstream，只出 artifact 不发 Release）。
+- fnpack 从官方 CDN 下载（`static2.fnnas.com/fnpack/fnpack-<ver>-linux-amd64|linux-arm`，
+  双架构都有），非 npm 包。
+- 原生 arm64 runner 上 npm 自然解析 arm64 optional deps（ripgrep），无 QEMU/代理。
+- 仓库托管在 GitHub（`bbsde/fn-native-deepseek-harness`，主分支 `main`），推送用
+  `$DSH_HOME/.ssh/id_ed25519_gitee`（GitHub Deploy key，Allow write）。
 
 - 每个架构独立 staging：`cache/dsh-runtime-x86_64/` 与 `cache/dsh-runtime-arm64/`，
   各自产出 `src/app/runtime-x86_64.tar.gz` / `runtime-arm64.tar.gz`；fnpack 前复制成
