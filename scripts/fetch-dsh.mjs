@@ -44,18 +44,12 @@ const isArm = arch === 'arm64'
 // npm/Node platform triple used by native module layouts.
 const nodePlatformArch = isArm ? 'linux-arm64' : 'linux-x64'
 
-// Default to a local install on this fnOS box. The old remote build host
-// (nas31) is no longer used; x86 is built with the device's own nodejs_v24
-// and arm64 via an emulated container (see the isArm branch below).
+// Default to a local install (this fnOS box for x86, or the CI arm64 runner).
+// The legacy remote build host (nas31) is only used when DSH_BUILD_HOST names it.
 const host = process.env.DSH_BUILD_HOST ?? 'local'
 const localBuild = host === 'local'
 const remoteDir = `/tmp/dsh-fpk-build/${version}`
 const dest = path.join(root, 'cache', `dsh-runtime-${arch}`)
-
-// HTTP proxy for the arm64 Docker build: the QEMU container reaches the host
-// proxy at 127.0.0.1:<port> only with --net=host. Falls back to DSH_PROXY or
-// the common 7890.
-const dockerProxy = process.env.DSH_PROXY || 'http://127.0.0.1:7890'
 
 const run = (command, args, options = {}) => {
   const result = spawnSync(command, args, { stdio: 'inherit', ...options })
@@ -66,11 +60,11 @@ const run = (command, args, options = {}) => {
 }
 
 // On a native arm64 host (GitHub's ubuntu-24.04-arm runner) the runtime tree
-// installs directly with the ambient npm — no QEMU container needed. The
-// emulated-container path below only applies when an x86 host builds arm64.
+// installs directly with the ambient npm. There is no emulated-container path
+// any more: local x86 hosts cannot build arm64 (use CI).
 const nativeArm = isArm && process.arch === 'arm64'
 
-if (localBuild || nativeArm) {
+if ((localBuild && !isArm) || nativeArm) {
   // Same runtime the installed app runs on; fall back to ambient node when
   // not on fnOS. Node major must match the target (24) so node-pty/koffi
   // natives are selected for the right ABI.
@@ -101,75 +95,13 @@ if (localBuild || nativeArm) {
     ...(runtimeBin ? { PATH: `${runtimeBin}:${process.env.PATH}` } : {}),
   }
   run('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: dest, env })
-} else if (isArm && !nativeArm) {
-  // arm64 build: there is no arm64 build NAS in this setup, and node-pty has
-  // no linux-arm64 prebuild, so we compile inside an emulated arm64 container
-  // on this x86 host (QEMU binfmt + an arm64 node image). The container uses
-  // --net=host so it can reach the host HTTP proxy (DSH_PROXY, default
-  // 127.0.0.1:7890) for apt + npm. The staged tree is written into `dest`
-  // via a bind mount.
-  const dockerImage = process.env.DSH_ARM_IMAGE || 'arm64v8/node:24'
-  const proxy = dockerProxy
-  const innerScript = `
-set -e
-export http_proxy=${proxy} https_proxy=${proxy}
-export npm_config_proxy=${proxy} npm_config_https_proxy=${proxy}
-export npm_config_registry=https://registry.npmmirror.com
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -o Acquire::http::Timeout=30
-apt-get install -y g++ make python3
-mkdir -p /out
-cd /out
-printf '%s' '${JSON.stringify({ name: 'dsh-runtime', private: true, dependencies: { '@deepseek-ai/dsh': version } })}' > package.json
-npm install --omit=dev --no-audit --no-fund --loglevel=error --no-package-lock
-`
-  fs.rmSync(dest, { recursive: true, force: true })
-  fs.mkdirSync(dest, { recursive: true })
-  const containerName = `dsh-arm-build-${version}`
-  // The dsh user is not in the docker group in the running session, so the
-  // docker invocation needs sudo. The container itself runs the build as root
-  // and reaches the host proxy via --net=host; no host PATH is involved there.
-  run('sudo', [
-    'docker', 'run', '--rm', '--platform', 'linux/arm64', '--net=host',
-    '--name', containerName,
-    '-v', `${dest}:/out`,
-    dockerImage,
-    'bash', '-c', innerScript,
-  ])
-  // The container runs as root, so the staged tree is owned by root; reclaim
-  // it so later steps (pack-runtime's chmod on rg) run as the unprivileged
-  // build user without EPERM.
-  run('sudo', ['chown', '-R', `${process.getuid()}:${process.getgid()}`, dest])
-  if (!fs.existsSync(path.join(dest, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))) {
-    console.error('arm64 docker build did not produce a dsh tree in the staging dir')
-    process.exit(1)
-  }
-  // npm inside the emulated container does not reliably resolve the arm64
-  // ripgrep optional dep — it installs the x64 binary instead (and any
-  // in-container follow-up install gets pruned by npm's tree reconciliation).
-  // Bypass npm entirely: fetch the arm64 ripgrep tarball directly from the
-  // China mirror on the host and extract it into node_modules.
-  {
-    const rgDir = path.join(dest, 'node_modules', '@vscode', 'ripgrep-linux-arm64')
-    const rgVersion = (() => {
-      try {
-        return JSON.parse(fs.readFileSync(path.join(dest, 'node_modules', '@vscode', 'ripgrep', 'package.json'), 'utf8')).version
-      } catch {
-        return '1.18.0'
-      }
-    })()
-    const mirror = process.env.DSH_NPM_MIRROR || 'https://registry.npmmirror.com'
-    const tgz = path.join(root, 'cache', `ripgrep-linux-arm64-${rgVersion}.tgz`)
-    console.log(`Fetching @vscode/ripgrep-linux-arm64@${rgVersion} from mirror ...`)
-    run('curl', ['-fsSL', '-o', tgz, `${mirror}/@vscode/ripgrep-linux-arm64/-/ripgrep-linux-arm64-${rgVersion}.tgz`])
-    fs.rmSync(rgDir, { recursive: true, force: true })
-    fs.mkdirSync(rgDir, { recursive: true })
-    run('tar', ['xzf', tgz, '-C', rgDir, '--strip-components=1'])
-    if (!fs.existsSync(path.join(rgDir, 'bin', 'rg'))) {
-      console.error(`arm64 ripgrep binary missing after extract: ${path.join(rgDir, 'bin', 'rg')}`)
-      process.exit(1)
-    }
-  }
+} else if (isArm) {
+  // arm64 builds happen on GitHub Actions' native arm64 runner (see
+  // .github/workflows/build.yml). Building arm64 on a local x86 host used to
+  // run a QEMU-emulated container, which took ~40 minutes per build and needed
+  // a host proxy; that path was removed in favour of CI.
+  console.error('arm64 builds are produced by GitHub Actions (ubuntu-24.04-arm runner); local arm64 builds require a native arm64 host (DSH_BUILD_HOST=local on arm64).')
+  process.exit(1)
 } else {
   const remoteScript = `
 set -e

@@ -47,7 +47,7 @@
 ```
 src/                 # fnpack 打包根（manifest、config/、cmd/、app/bin/relay.mjs、app/ui/）
 cache/dsh-runtime-x86_64/  # 构建缓存：x86_64 的 dsh node_modules（勿手改，勿提交）
-cache/dsh-runtime-arm64/    # 构建缓存：arm64 的 dsh node_modules（QEMU 容器内编译）
+cache/dsh-runtime-arm64/    # 构建缓存：arm64 的 dsh node_modules（仅 CI/原生 arm 主机产生）
 src/app/runtime.tar.gz  # 构建期生成：runtime 整树单文件 tar（33k 文件打包成 1 个，
                       #   安装秒级；cmd/install_callback 解压到 $TRIM_PKGVAR/runtime）
 scripts/             # fetch-dsh / rewrite-dist / build / 本地与真机测试脚本
@@ -87,38 +87,39 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
 - nas31 需要一次性装好工具链：`sudo apt-get install -y g++ make python3`（node-pty 编译用）。
 - **fnOS `platform` 字段取值**：`x86`（仅 x86 设备）/ `arm`（仅 ARM 设备）/ `all`（同时支持，但仅当包内不含架构特定二进制时）。本应用内含架构相关的原生模块（node-pty/koffi/ripgrep 都是特定架构的 .node/.so），**不能用 `all`**——必须出两个独立包（`platform=x86` 与 `platform=arm`），分别安装到对应架构设备。
 
-### 双架构一键构建（当前主机环境）
+### 双架构构建（GitHub Actions 为主路径）
 
-`build.sh` 默认一次产出 **两个 fpk**：`dist/dsh_<ver>_x86.fpk`（platform=x86）和
-`dist/dsh_<ver>_arm.fpk`（platform=arm）。用 `DSH_ARCHS="x86_64 arm64"`（默认）控制，
-可只构建子集，如 `DSH_ARCHS=arm64 ./build.sh`。
+**主路径是 CI**：`.github/workflows/build.yml` 在 push/master 和手动触发时跑双 runner 矩阵
+——`ubuntu-latest`（x86_64）+ `ubuntu-24.04-arm`（**原生 arm64 runner**），各自下载对应
+架构的 fnpack（官方 CDN `static2.fnnas.com/fnpack/fnpack-<ver>-linux-amd64|linux-arm`），
+跑 `DSH_ARCHS=<arch> ./build.sh` 产出 fpk 并上传 artifact；**打 `v*` tag 自动建 Release
+附双 fpk**。原生 runner 上 npm 自然解析 arm64 的 optional deps（ripgrep），无 QEMU/代理/
+镜像配置，单包构建约 5 分钟。仓库托管在 GitHub（`bbsde/fn-native-deepseek-harness`），
+推送用 `$DSH_HOME/.ssh/id_ed25519_gitee`（GitHub Deploy key，Allow write）。
+
+**本地构建仅 x86**（`DSH_ARCHS=x86_64`，默认走本机 nodejs_v24）。本地 x86 主机上请求
+arm64 会明确报错指向 CI——曾经的 QEMU 容器模拟路径（约 40 分钟/次 + 宿主代理依赖）已移除。
+若有原生 arm64 Linux 机器，`DSH_ARCH=arm64 DSH_BUILD_HOST=local` 可直接本机构建。
 
 - 每个架构独立 staging：`cache/dsh-runtime-x86_64/` 与 `cache/dsh-runtime-arm64/`，
   各自产出 `src/app/runtime-x86_64.tar.gz` / `runtime-arm64.tar.gz`；fnpack 前复制成
   `src/app/runtime.tar.gz`（install_callback 仍解这个固定名，包内已是对应的架构）。
-- **x86_64**：本机 `nodejs_v24` 直接 `npm install`（`DSH_BUILD_HOST=local` 逻辑，已默认）。
-- **arm64**：本机 x86 上用 QEMU 用户态模拟跑 `arm64v8/node:24` 容器编译（node-pty 在
-  linux-arm64 无预编译，必须容器内 g++ 源码编译）。前提：
-  1. binfmt_misc 注册了 `qemu-aarch64`（装 `qemu-user-static` 包的 systemd 服务会做）；
-  2. 容器 `--net=host` 并通过宿主 HTTP 代理拉 apt/npm——代理地址由 `DSH_PROXY`
-     （默认 `http://127.0.0.1:7890`）指定，需宿主机梯子监听在 127.0.0.1（容器
-     `--net=host` 下 localhost 即宿主 localhost）；arm64 镜像需能经梯子拉取
-     （如 `arm64v8/node:24`，可改 `DSH_ARM_IMAGE`）。
-  - QEMU 下 npm 依赖树解析极慢（500+ 包可能数分钟纯 CPU 0 落盘），属已知瓶颈，
-    编译本身没问题（单包 node-pty 约 52s 编出 arm64 pty.node，已验证）。
 - `fetch-dsh.mjs` / `rewrite-dist.mjs` / `pack-runtime.mjs` 均读 `DSH_ARCH`
   （`x86_64` 默认 / `arm64`）选择 staging 目录、ripgrep 平台包名（`ripgrep-linux-x64`
   / `ripgrep-linux-arm64`）和 pty 校验路径（`linux-x64` / `linux-arm64`）。
+- **ELF e_machine 硬校验**：fetch 校验 pty.node、pack 校验 rg 的 `e_machine`
+  （arm64=0xb7，x86-64=0x3e）。曾发生过"staging 标 arm 实际装出 x64 树"的事故
+  （分支优先级 bug），magic-only 校验拦不住，e_machine 校验让这类错误当场失败。
 - `rewrite-dist.mjs` 是对上游产物的**构建期补丁**（非源码 fork）：把 dist 外壳和 39 个
   `dsh.client` 插件包（经 package.json exports["./client"] 发现）中的根绝对 URL
   （`"/api`、`"/assets/`、`"/plugins/`、反引号形式、webmanifest 的 start_url/scope/id）
   改写为网关前缀。带校验门禁：模式消失/计数异常 → 构建失败。
   **升级 dshVersion 后重写失败时，先检查上游打包方式变化，更新规则集，再重新验证。**
 - glob/grep 工具不用系统 `rg`，而是 spawn 上游 vendor 的
-  `node_modules/@vscode/ripgrep-linux-x64/bin/rg`——树里唯一必须带执行位的文件
+  `node_modules/@vscode/ripgrep-linux-<arch>/bin/rg`——树里唯一必须带执行位的文件
   （.node/.so 走 dlopen 只要读权限）。旧 Windows/MSYS tar 往返构建曾丢过该执行位：
   装出的应用一切正常、唯独 glob/grep 报 `ripgrep launch failed`（spawn EACCES）。
-  `pack-runtime.mjs` 现已强制 chmod 0o755 并校验 ELF；本机构建天然规避此问题。
+  `pack-runtime.mjs` 现已强制 chmod 0o755 并校验 ELF。
 
 ## 开发测试生命周期（平台：nas31）
 
