@@ -9,5 +9,5 @@
     "icons": "node scripts/make-icons.mjs",
     "build": "node scripts/build.mjs"
   },
-  "dshVersion": "0.1.0-rc.6"
+  "dshVersion": "0.1.0-rc.7"
 }
