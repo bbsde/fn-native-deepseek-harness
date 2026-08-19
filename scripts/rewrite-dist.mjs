@@ -56,6 +56,14 @@ const MANIFEST_RULES = [
   ['"scope": "/"', `"scope": "${prefix}/"`],
   ['"id": "/"', `"id": "${prefix}/"`],
 ]
+// The PWA manifest cannot be served usefully behind the fnOS gateway: the
+// browser's manifest prefetch arrives without NAS login state, the gateway
+// answers plain text ("invalid token"), and Chrome's manifest parser logs
+// "Line: 1, column: 1, Syntax error" in the console on every page load. The
+// app is opened as a fnOS tab and never installed as a PWA, so the link is
+// dropped instead. Matches both the root-absolute and already-prefixed href.
+const MANIFEST_LINK = /<link\s+rel="manifest"\s+href="[^"]*manifest\.webmanifest"\s*\/?>/
+
 // The generic connection RPC channel constant ("/api") is prefixed by TEXT_RULES
 // into a multi-segment path ("/app/dsh/api"), but the client validates channel
 // strings against a single-segment pattern; without this widening every generic
@@ -142,7 +150,7 @@ const clientBundles = discoverClientBundles()
   const htmlNow = fs.readFileSync(path.join(dist, 'index.html'), 'utf8')
   const connBundle = clientBundles.find((file) => file.includes('dsh-client-connection'))
   const jsNow = connBundle === undefined ? '' : fs.readFileSync(connBundle, 'utf8')
-  if (htmlNow.includes(`"${prefix}/assets/`) && jsNow.includes(`"${prefix}/api`) && jsNow.includes(CHANNEL_PATTERN_RULE[0][1])) {
+  if (htmlNow.includes(`"${prefix}/assets/`) && !htmlNow.includes('manifest.webmanifest') && jsNow.includes(`"${prefix}/api`) && jsNow.includes(CHANNEL_PATTERN_RULE[0][1])) {
     console.log('Runtime already carries the gateway prefix; rewrite skipped.')
     process.exit(0)
   }
@@ -154,6 +162,19 @@ for (const file of clientBundles) rewriteFile(file, ruleSetsFor(file))
 // --- verification -----------------------------------------------------------
 
 const failures = []
+
+// Strip the manifest <link> after the text rules have run, so the regex sees
+// the prefixed href as well as the original. Gated like every other rule: a
+// zero-match means upstream changed the tag and this step silently stopped
+// working, which must fail the build.
+{
+  const file = path.join(dist, 'index.html')
+  const html = fs.readFileSync(file, 'utf8')
+  const stripped = html.replace(MANIFEST_LINK, '')
+  if (stripped === html) failures.push('index.html: manifest <link> not found — upstream tag format changed')
+  else fs.writeFileSync(file, stripped)
+}
+
 const html = fs.readFileSync(path.join(dist, 'index.html'), 'utf8')
 if (!html.includes(`"${prefix}/assets/`)) failures.push('index.html: no /assets/ rewrite landed')
 
