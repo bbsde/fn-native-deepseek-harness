@@ -7,7 +7,8 @@ set -u
 
 APPNAME="dsh"
 GATEWAY_PREFIX="/app/${APPNAME}"
-DSH_PORT=3080
+# Overridable for parallel test instances on a device (production: 3080).
+DSH_PORT="${DSH_PORT:-3080}"
 
 DSH_HOME_DIR="${TRIM_PKGVAR}/dsh"
 LOG_FILE="${TRIM_PKGVAR}/app.log"
@@ -20,6 +21,35 @@ SOCKET_PATH="${TRIM_APPDEST}/app.sock"
 RUNTIME_DIR="${TRIM_PKGVAR}/runtime"
 DSH_BIN="${RUNTIME_DIR}/node_modules/@deepseek-ai/dsh/lib/bin.js"
 RELAY_BIN="${TRIM_APPDEST}/bin/relay.mjs"
+# Seeds the bundled plugin marketplace (PATH shims, resolution symlinks, the
+# web-profile rows, the data snapshot) before dsh boots and composes profiles.
+MARKET_SEED_BIN="${TRIM_APPDEST}/bin/seed-market.mjs"
+# Last-known-good snapshot + surgical profile recovery (see the watchdog in
+# start_app): snapshots the web profile's input files after every successful
+# boot so a later broken-plugin boot can be repaired by restoring them.
+SALVAGE_BIN="${TRIM_APPDEST}/bin/profile-salvage.mjs"
+LASTGOOD_DIR="${DSH_HOME_DIR}/lastgood-web"
+# Loopback stale-while-revalidate cache for the market's plugin catalog. From
+# CN networks the origin (GitHub Pages) throttles the ~1.25 MB catalog to
+# 12-138 s per full fetch while dshmarket budgets 15 s x2 — see
+# bin/catalog-cache.mjs. Dies soft: without it dshmarket talks to the origin
+# directly, exactly as upstream ships it.
+MARKET_CACHE_BIN="${TRIM_APPDEST}/bin/catalog-cache.mjs"
+MARKET_CACHE_PORT="${DSH_MARKET_CACHE_PORT:-3180}"
+MARKET_CACHE_PID_FILE="${TRIM_PKGVAR}/market-cache.pid"
+# Keeps dsh web and the relay alive between app-center starts and performs
+# tracked restarts on behalf of the market's restart button (the relay drops
+# a flag file; see supervise-web.sh). Spawned in its own session so a stop
+# can take down the whole supervision tree in one signal.
+SUPERVISOR_BIN="${TRIM_APPDEST}/bin/supervise-web.sh"
+SUPERVISOR_PID_FILE="${TRIM_PKGVAR}/supervisor.pid"
+RESTART_FLAG="${TRIM_PKGVAR}/restart-web"
+# This script's own resolved path, handed to the supervisor so it can invoke
+# the very cmd/main that started it — fnOS keeps lifecycle scripts under
+# /var/apps/<appname>/cmd/, NOT under TRIM_APPDEST (rc.7.14 shipped a broken
+# hardcoded ${TRIM_APPDEST}/cmd/main there and every supervised restart died
+# with "No such file or directory").
+MAIN_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
 export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
 
@@ -53,6 +83,484 @@ status_app() {
   pid_alive "$DSH_PID_FILE" && pid_alive "$RELAY_PID_FILE"
 }
 
+# PIDs of live dsh web servers bound to our port (argv: node <DSH_BIN> web
+# --port <DSH_PORT>). Anything not tracked in dsh.pid — e.g. a replacement
+# spawned by dshmarket's detached self-restart helper from an older app
+# version — must be swept before relaunching/stopping, or it holds the port
+# and the fresh instance dies with EADDRINUSE. Pure /proc scan: no procps
+# dependency.
+find_web_pids() {
+  local proc cmdline
+  for proc in /proc/[0-9]*/cmdline; do
+    [ -r "$proc" ] || continue
+    cmdline="$(tr '\0' ' ' < "$proc" 2>/dev/null)" || continue
+    case "$cmdline" in
+      *"${DSH_BIN} web --port ${DSH_PORT}"*) echo "${proc#/proc/}" | sed 's#/cmdline$##' ;;
+    esac
+  done
+}
+
+# Any HTTP answer from the loopback listener means dsh web composed its
+# profile and is serving (its browser-trust fence answers 403 to curl — that
+# still proves liveness).
+web_port_serving() {
+  curl -s --max-time 3 -o /dev/null "http://127.0.0.1:${DSH_PORT}/"
+}
+
+seed_market() {
+  [ -f "$MARKET_SEED_BIN" ] || return 0
+  node "$MARKET_SEED_BIN" --runtime "$RUNTIME_DIR" --home "$DSH_HOME_DIR" \
+    --bindir "${TRIM_PKGVAR}/bin" >> "$LOG_FILE" 2>&1 \
+    || log_msg "market seed reported problems (non-fatal)"
+}
+
+# The GitHub acceleration root ("" = off), re-read from the override file on
+# every call so relay relaunches pick up device-level changes. Shared by the
+# dsh process env and the relay's --gh-proxy so the two never drift.
+github_accel_root() {
+  local accel="https://gh-proxy.com/"
+  if [ -f "${TRIM_PKGVAR}/github-accel" ]; then
+    accel="$(head -n 1 "${TRIM_PKGVAR}/github-accel" | tr -d '[:space:]')"
+  fi
+  case "$accel" in
+    ""|off|none) echo "" ;;
+    *) echo "$accel" ;;
+  esac
+}
+
+# The full dsh launch environment, sourced inside a subshell before exec'ing
+# anything dsh-related: workspace cwd, HOME, caches, PATH shims, mirrors and
+# the GitHub accelerator. Both the web server and the online market install
+# run under it, so a supervised restart and a first-boot install behave
+# identically to a cold start.
+dsh_launch_env() {
+  cd "$WORKSPACE_DIR" || return 1
+  # The directory picker defaults to os.homedir(); without HOME the dsh
+  # user's passwd entry (/home/dsh) does not exist on fnOS. Pointing HOME
+  # at the shared workspace also makes "~" land in the user-visible share.
+  # npm/XDG caches are redirected so tooling dotdirs stay out of the share.
+  export HOME="$WORKSPACE_DIR"
+  export XDG_CACHE_HOME="$DSH_HOME_DIR/.xdg/cache"
+  export XDG_CONFIG_HOME="$DSH_HOME_DIR/.xdg/config"
+  export XDG_DATA_HOME="$DSH_HOME_DIR/.xdg/data"
+  export npm_config_cache="$DSH_HOME_DIR/.npm-cache"
+  # The marketplace's one-click install resolves bare `dsh`/`pnpm` from
+  # PATH; seed-market.mjs maintains those shims in $TRIM_PKGVAR/bin.
+  export PATH="${TRIM_PKGVAR}/bin:$PATH"
+  # Plugin installs (dshmarket -> dsh plugin add -> pnpm) pull the package
+  # and the profile's whole dependency tree from the npm registry; on CN
+  # networks npmjs crawls, so default the chain to npmmirror (pnpm honors
+  # npm_config_registry, node-gyp headers honor NODEJS_ORG_MIRROR —
+  # plugins with native deps compile against the mirrored headers). An
+  # escape hatch for mirror trouble (brand-new package not synced yet):
+  #   echo https://registry.npmjs.org | sudo tee $TRIM_PKGVAR/npm-registry
+  # then restart the app.
+  local market_registry="https://registry.npmmirror.com"
+  if [ -f "${TRIM_PKGVAR}/npm-registry" ]; then
+    market_registry="$(head -n 1 "${TRIM_PKGVAR}/npm-registry" | tr -d '[:space:]')"
+  fi
+  export npm_config_registry="$market_registry"
+  export NODEJS_ORG_MIRROR="https://npmmirror.com/mirrors/node/"
+  # GitHub-sourced plugins (git+https://github.com/… specs through pnpm,
+  # skill-type git clones) pull whole repos from github.com, which is
+  # unreliable on CN networks. Rewrite every https://github.com/ git URL
+  # through an acceleration prefix with git's insteadOf mechanism — env
+  # based, so it applies to every git invocation under this app only
+  # (including the agent's own clones). gh-proxy-style proxies need the
+  # complete original URL in the path, so the config holds a proxy ROOT
+  # (trailing slash) and the base is built by appending https://github.com/;
+  # a value that already carries github.com is used as-is. Override or
+  # disable per device (gh-proxy.org is a 301 alias of gh-proxy.com):
+  #   echo https://ghproxy.net/ | sudo tee $TRIM_PKGVAR/github-accel
+  #   : | sudo tee $TRIM_PKGVAR/github-accel      (empty or "off" = off)
+  local github_accel
+  github_accel="$(github_accel_root)"
+  if [ -n "$github_accel" ]; then
+    export GIT_CONFIG_COUNT=1
+    export GIT_CONFIG_KEY_0="url.${github_accel}https://github.com/.insteadOf"
+    export GIT_CONFIG_VALUE_0="https://github.com/"
+    # pnpm's GitHub tarball downloads (https://codeload.github.com/…) are
+    # plain HTTPS, not git CLI — insteadOf cannot see them. The preload
+    # rewrites those at the https.request/fetch layer; it must ride along
+    # with every Node child (dsh CLI, pnpm), hence NODE_OPTIONS.
+    # gh-accel-preload.cjs normalizes full prefixes.
+    export DSH_GH_ACCEL="$github_accel"
+    export NODE_OPTIONS="--require ${TRIM_APPDEST}/bin/gh-accel-preload.cjs${NODE_OPTIONS:+ ${NODE_OPTIONS}}"
+  fi
+  mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$npm_config_cache" 2>/dev/null || true
+  return 0
+}
+
+launch_dsh_web() {
+  log_msg "Starting dsh web on 127.0.0.1:$DSH_PORT (cwd $WORKSPACE_DIR)"
+  (
+    dsh_launch_env || exit 1
+    # Market catalog fetch through the local stale-while-revalidate cache,
+    # when the app found it serving (empty = origin directly, as upstream).
+    if [ -n "${MARKET_CACHE_URL:-}" ]; then
+      export DSHM_REGISTRY_URL="$MARKET_CACHE_URL"
+    fi
+    DSH_HOME="$DSH_HOME_DIR" exec node "$DSH_BIN" web --port "$DSH_PORT"
+  ) >> "$LOG_FILE" 2>&1 &
+  echo $! > "$DSH_PID_FILE"
+}
+
+# Online install of the market plugin (dshmarket rides NO LONGER in the fpk:
+# a real pnpm install inside the profile means self-updates persist across
+# restarts instead of being reverted by a reseed). Runs the upstream CLI flow
+# so the profile shape is exactly what `dsh plugin --profile web add` makes;
+# bounded by timeout when available because appcenter's start patience is
+# shorter than pnpm's worst day. Non-fatal: the caller falls back to a bare
+# profile and retries on the next start.
+install_market_online() {
+  log_msg "installing the market plugin online (dsh plugin --profile web add dshmarket)"
+  (
+    dsh_launch_env || exit 1
+    if [ -n "${MARKET_CACHE_URL:-}" ]; then
+      export DSHM_REGISTRY_URL="$MARKET_CACHE_URL"
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+      DSH_HOME="$DSH_HOME_DIR" timeout 600 node "$DSH_BIN" plugin --profile web add dshmarket
+      exit $?
+    fi
+    DSH_HOME="$DSH_HOME_DIR" node "$DSH_BIN" plugin --profile web add dshmarket
+  ) >> "$LOG_FILE" 2>&1
+}
+
+# seed_market's decision layer + the online install behind it. seed-market.mjs
+# prints NEEDS_MARKET_INSTALL when the market is absent or broken (fresh
+# device, vendored-era dangling symlink, uninstalled mid-session); after a
+# successful install it re-runs to stamp presence. On failure the fallback is
+# a bare web profile (dsh's own bundles only) so an OFFLINE first boot still
+# works — the market then installs on the next start.
+ensure_market() {
+  [ -f "$MARKET_SEED_BIN" ] || return 0
+  local seed_out
+  seed_out="$(node "$MARKET_SEED_BIN" --runtime "$RUNTIME_DIR" --home "$DSH_HOME_DIR" \
+    --bindir "${TRIM_PKGVAR}/bin" 2>&1)"
+  printf '%s\n' "$seed_out" >> "$LOG_FILE"
+  if printf '%s' "$seed_out" | grep -q NEEDS_MARKET_INSTALL; then
+    if install_market_online; then
+      node "$MARKET_SEED_BIN" --runtime "$RUNTIME_DIR" --home "$DSH_HOME_DIR" \
+        --bindir "${TRIM_PKGVAR}/bin" >> "$LOG_FILE" 2>&1 \
+        || log_msg "market seed reported problems (non-fatal)"
+      log_msg "market plugin installed online"
+    else
+      log_msg "market online install failed; seeding a bare web profile and retrying on the next start"
+      node "$MARKET_SEED_BIN" --runtime "$RUNTIME_DIR" --home "$DSH_HOME_DIR" \
+        --bindir "${TRIM_PKGVAR}/bin" --seed-bare >> "$LOG_FILE" 2>&1 \
+        || log_msg "bare profile seed reported problems (non-fatal)"
+    fi
+  fi
+  return 0
+}
+
+launch_relay() {
+  log_msg "Starting gateway relay on $SOCKET_PATH"
+  rm -f "$SOCKET_PATH"
+  local relay_gh
+  relay_gh="$(github_accel_root)"
+  [ -z "$relay_gh" ] && relay_gh="off"
+  (
+    exec node "$RELAY_BIN" --socket "$SOCKET_PATH" --target "127.0.0.1:$DSH_PORT" \
+      --prefix "$GATEWAY_PREFIX" --restart-flag "$RESTART_FLAG" --gh-proxy "$relay_gh"
+  ) >> "$LOG_FILE" 2>&1 &
+  echo $! > "$RELAY_PID_FILE"
+}
+
+# Spawn the market catalog cache unless it is already running (or disabled /
+# not shipped). Called from start_app and again from supervised restarts so
+# the cache survives web restarts.
+ensure_market_cache() {
+  [ -f "$MARKET_CACHE_BIN" ] || return 0
+  pid_alive "$MARKET_CACHE_PID_FILE" && return 0
+  local market_origin="https://awesome-dsh-plugin.com/plugins.json"
+  if [ -f "${TRIM_PKGVAR}/market-registry" ]; then
+    market_origin="$(head -n 1 "${TRIM_PKGVAR}/market-registry" | tr -d '[:space:]')"
+  fi
+  case "$market_origin" in
+    ""|off|none)
+      log_msg "market catalog cache disabled (market-registry)"
+      ;;
+    *)
+      log_msg "Starting market catalog cache on 127.0.0.1:$MARKET_CACHE_PORT (origin $market_origin)"
+      (
+        exec node "$MARKET_CACHE_BIN" --port "$MARKET_CACHE_PORT" --origin "$market_origin" \
+          --cache-dir "${DSH_HOME_DIR}/market-cache"
+      ) >> "$LOG_FILE" 2>&1 &
+      echo $! > "$MARKET_CACHE_PID_FILE"
+      ;;
+  esac
+}
+
+# Sets MARKET_CACHE_URL when the local catalog cache is actually serving;
+# empty keeps dshmarket on its built-in origin URL. Polled, not assumed: the
+# cache may live on a different app instance's launch or may have just died.
+resolve_market_cache_url() {
+  MARKET_CACHE_URL=""
+  [ -f "$MARKET_CACHE_BIN" ] || return 0
+  local cache_wait=0
+  while [ "$cache_wait" -lt 5 ]; do
+    if curl -s --max-time 2 -o /dev/null "http://127.0.0.1:${MARKET_CACHE_PORT}/healthz"; then
+      MARKET_CACHE_URL="http://127.0.0.1:${MARKET_CACHE_PORT}/plugins.json"
+      return 0
+    fi
+    sleep 1
+    cache_wait=$((cache_wait + 1))
+  done
+  return 0
+}
+
+# 0 = dsh web is listening, 1 = timed out (process still alive),
+# 2 = the process died before ever listening.
+wait_dsh_ready() {
+  local deadline="$1" waited=0 pid
+  pid="$(read_pid "$DSH_PID_FILE")"
+  while [ "$waited" -lt "$deadline" ]; do
+    if [ -z "$pid" ] || ! check_process "$pid"; then
+      return 2
+    fi
+    # Any HTTP answer means the web profile composed and the server is up;
+    # connection refused (curl exit 7) / timeout (28) just means "not yet".
+    if web_port_serving; then
+      return 0
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
+# Remember the profile shape that just booted: the volatile input files go
+# to $DSH_HOME/lastgood-web. The surgical recovery below restores exactly
+# this snapshot, so anything that booted once is protected from later
+# breakage. Runs after every successful boot; content-compared, so usually a
+# no-op. Never fatal.
+snapshot_lastgood() {
+  [ -f "$SALVAGE_BIN" ] || return 0
+  [ -d "${DSH_HOME_DIR}/profiles/web" ] || return 0
+  node "$SALVAGE_BIN" --snapshot --profile "${DSH_HOME_DIR}/profiles/web" \
+    --lastgood "$LASTGOOD_DIR" >> "$LOG_FILE" 2>&1 \
+    || log_msg "lastgood snapshot failed (non-fatal)"
+}
+
+# Surgical recovery, tried before the reseed: park the broken profile, swap
+# its input files (package.json, patch layer, workspace stub, lock) for the
+# last-known-good snapshot, delete node_modules entries for plugins installed
+# since that snapshot, and boot the result. dsh loads a profile strictly from
+# its manifest, so the culprits stop loading while everything that ran at the
+# last good boot survives intact. Exit codes: 0 = salvaged and ready,
+# 1 = did not help or not possible (caller falls back to reseed_web_profile),
+# 2 = could not park/move things (fatal; leave everything in place).
+salvage_web_profile() {
+  [ -f "$SALVAGE_BIN" ] || return 1
+  [ -f "${LASTGOOD_DIR}/package.json" ] || return 1
+  local bak culprits
+  bak="${DSH_HOME_DIR}/profiles/web.recovery.$(date +%Y%m%d%H%M%S)"
+  log_msg "dsh web not ready; attempting salvage from the last-known-good profile"
+  mv "${DSH_HOME_DIR}/profiles/web" "$bak" 2>>"$LOG_FILE" || return 2
+  if ! culprits="$(node "$SALVAGE_BIN" --restore --profile "$bak" --lastgood "$LASTGOOD_DIR" 2>>"$LOG_FILE")"; then
+    log_msg "salvage restore failed; the broken profile stays parked at ${bak}"
+    return 1
+  fi
+  mv "$bak" "${DSH_HOME_DIR}/profiles/web" 2>>"$LOG_FILE" || {
+    log_msg "could not move the salvaged profile back from ${bak}"
+    return 2
+  }
+  ensure_market
+  launch_dsh_web
+  if wait_dsh_ready "${DSH_BOOT_TIMEOUT:-180}"; then
+    log_msg "salvage boot OK; removed plugin(s) installed since the last good boot: ${culprits:-none}"
+    return 0
+  fi
+  log_msg "salvage boot still not ready; parking the attempt and falling back to a fresh seed"
+  mv "${DSH_HOME_DIR}/profiles/web" \
+    "${DSH_HOME_DIR}/profiles/web.recovery.$(date +%Y%m%d%H%M%S).salvaged" 2>>"$LOG_FILE" || return 2
+  return 1
+}
+
+# Fresh-seed recovery (the original watchdog path, now the fallback): park
+# the whole profile aside (kept for inspection) and boot a freshly seeded
+# one. Tolerates an already-parked profile (salvage may leave it parked) —
+# seed_market then recreates the skeleton. Same exit-code contract as
+# salvage_web_profile.
+reseed_web_profile() {
+  local bak
+  if [ -d "${DSH_HOME_DIR}/profiles/web" ]; then
+    bak="${DSH_HOME_DIR}/profiles/web.recovery.$(date +%Y%m%d%H%M%S)"
+    log_msg "parking web profile to ${bak} and retrying with a fresh seed"
+    mv "${DSH_HOME_DIR}/profiles/web" "$bak" 2>>"$LOG_FILE" || {
+      log_msg "could not park the web profile; leaving it in place"
+      return 2
+    }
+  else
+    log_msg "no web profile in place; seeding a fresh one"
+  fi
+  ensure_market
+  launch_dsh_web
+  if wait_dsh_ready "${DSH_BOOT_TIMEOUT:-180}"; then
+    log_msg "recovery boot OK; the previous profile is kept for inspection under profiles/"
+    return 0
+  fi
+  log_msg "dsh web still not ready after profile recovery"
+  return 1
+}
+
+# Boot patience + the two-stage recovery cascade + the post-boot snapshot.
+# Shared by start_app and supervised restarts so a restart gets the exact
+# same watchdog treatment as a cold start. 0 = serving, 1 = not serving.
+boot_web_with_watchdog() {
+  wait_dsh_ready "${DSH_BOOT_TIMEOUT:-180}"
+  local boot_rc=$?
+  if [ "$boot_rc" -ne 0 ]; then
+    if [ ! -d "${DSH_HOME_DIR}/profiles/web" ]; then
+      log_msg "dsh web not ready (rc=${boot_rc}) and no web profile to park"
+      echo "dsh web failed to start; see $LOG_FILE" > "$TRIM_TEMP_LOGFILE"
+      return 1
+    fi
+    salvage_web_profile
+    local salvage_rc=$?
+    if [ "$salvage_rc" -eq 0 ]; then
+      :
+    elif [ "$salvage_rc" -eq 2 ]; then
+      echo "dsh web failed to start; see $LOG_FILE" > "$TRIM_TEMP_LOGFILE"
+      return 1
+    else
+      reseed_web_profile
+      local reseed_rc=$?
+      if [ "$reseed_rc" -ne 0 ]; then
+        if [ "$reseed_rc" -eq 2 ]; then
+          echo "dsh web failed to start; see $LOG_FILE" > "$TRIM_TEMP_LOGFILE"
+        else
+          echo "dsh web failed to start even after profile recovery; see $LOG_FILE" > "$TRIM_TEMP_LOGFILE"
+        fi
+        return 1
+      fi
+    fi
+  fi
+  # The profile just booted — this is the shape future salvages restore to.
+  snapshot_lastgood
+  return 0
+}
+
+# Stop dsh web only (relay and cache keep serving): the tracked pid first,
+# then any untracked instance holding our port (a replacement spawned by
+# dshmarket's detached self-restart helper from an app version older than
+# the relay interception, or a restart race), then any still-pending helper
+# ("node -e" with a dsh-market-restart script), and finally a bounded wait
+# for the port to go quiet so the next bind cannot lose to TIME_WAIT.
+stop_web_only() {
+  stop_one "$DSH_PID_FILE" "dsh web"
+  local pid count strays
+  strays="$(find_web_pids)"
+  for pid in $strays; do
+    log_msg "sweeping untracked dsh web process (pid $pid)"
+    kill -TERM "$pid" 2>>"$LOG_FILE" || true
+  done
+  for proc in /proc/[0-9]*/cmdline; do
+    [ -r "$proc" ] || continue
+    case "$(tr '\0' ' ' < "$proc" 2>/dev/null)" in
+      *dsh-market-restart*)
+        pid="${proc#/proc/}"; pid="${pid%/cmdline}"
+        log_msg "sweeping pending dshmarket restart helper (pid $pid)"
+        kill -TERM "$pid" 2>>"$LOG_FILE" || true
+        ;;
+    esac
+  done
+  count=0
+  while [ "$count" -lt 15 ]; do
+    strays="$(find_web_pids)"
+    [ -z "$strays" ] && ! web_port_serving && break
+    for pid in $strays; do kill -KILL "$pid" 2>>"$LOG_FILE" || true; done
+    sleep 1
+    count=$((count + 1))
+  done
+  if web_port_serving; then
+    log_msg "port $DSH_PORT still answers after the web sweep; next bind may race"
+  fi
+}
+
+# stop_one, but for a process spawned with setsid: signal the whole group so
+# children it is currently managing (a supervised restart in flight) die with
+# it and cannot respawn anything afterwards. Non-leader pids simply fall back
+# to the single-pid kill.
+stop_group() {
+  local pid_file="$1" name="$2" pid count
+  pid="$(read_pid "$pid_file")"
+  if [ -z "$pid" ] || ! check_process "$pid"; then
+    rm -f "$pid_file"
+    return 0
+  fi
+  log_msg "Stopping $name (pid $pid, process group)"
+  kill -TERM -- "-$pid" 2>>"$LOG_FILE" || kill -TERM "$pid" 2>>"$LOG_FILE" || true
+  count=0
+  while check_process "$pid" && [ "$count" -lt 10 ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+  if check_process "$pid"; then
+    kill -KILL -- "-$pid" 2>>"$LOG_FILE" || kill -KILL "$pid" 2>>"$LOG_FILE" || true
+  fi
+  rm -f "$pid_file"
+}
+
+# A supervised restart must not outlive its caller: if the supervisor (or the
+# app-center start that shares this code path with no parent) is gone, the
+# app is being stopped and relaunching would fight the stop.
+parent_alive() {
+  [ -z "${1:-}" ] && return 0
+  check_process "$1"
+}
+
+# Tracked replacement of dsh web: stop everything serving the port, boot a
+# fresh instance with the full launch environment (workspace cwd, mirrors,
+# accelerators, catalog-cache routing — none of which dshmarket's own
+# self-restart replay provides), run the boot watchdog, snapshot the profile.
+# The supervisor calls this when the relay flags the market's restart button
+# or when the web process died on its own. Optional $1: caller pid for the
+# liveness guard above.
+supervised_restart() {
+  local parent="${1:-}" count
+  log_msg "supervised web restart: stopping the current dsh web"
+  stop_web_only
+  parent_alive "$parent" || { log_msg "supervisor gone; aborting the restart"; return 1; }
+  # Restarting is also the cheap moment for the dangling-symlink sweep:
+  # plugin churn while the app ran is exactly what leaves pnpm .bin danglers.
+  count="$(find "$TRIM_PKGVAR" -xtype l -print -delete 2>/dev/null | wc -l)"
+  if [ "${count:-0}" -gt 0 ]; then
+    log_msg "removed $count dangling symlink(s) under $TRIM_PKGVAR (upgrade-chown guard)"
+  fi
+  parent_alive "$parent" || { log_msg "supervisor gone; aborting the restart"; return 1; }
+  ensure_market
+  ensure_market_cache
+  resolve_market_cache_url
+  launch_dsh_web
+  if boot_web_with_watchdog; then
+    log_msg "supervised web restart: dsh web is back on 127.0.0.1:$DSH_PORT"
+    rm -f "$RESTART_FLAG"
+    return 0
+  fi
+  log_msg "supervised web restart did not bring dsh web back"
+  return 1
+}
+
+start_supervisor() {
+  [ -f "$SUPERVISOR_BIN" ] || return 0
+  if pid_alive "$SUPERVISOR_PID_FILE"; then
+    return 0
+  fi
+  log_msg "Starting web supervisor (poll every ${DSH_SUPERVISE_POLL:-5}s)"
+  (
+    export TRIM_PKGVAR TRIM_APPDEST DSH_PORT LOG_FILE SUPERVISOR_PID_FILE MAIN_BIN="$MAIN_SELF"
+    export DSH_SUPERVISE_POLL="${DSH_SUPERVISE_POLL:-5}" DSH_BOOT_TIMEOUT="${DSH_BOOT_TIMEOUT:-180}"
+    if command -v setsid >/dev/null 2>&1; then
+      exec setsid bash "$SUPERVISOR_BIN"
+    fi
+    exec bash "$SUPERVISOR_BIN"
+  ) >> "$LOG_FILE" 2>&1 < /dev/null &
+  echo $! > "$SUPERVISOR_PID_FILE"
+}
+
 start_app() {
   if status_app; then
     return 0
@@ -68,32 +576,47 @@ start_app() {
     return 1
   fi
 
+  # Dangling symlinks under the data dir (pnpm .bin shims left behind when a
+  # plugin's files are force-removed) abort the appcenter upgrade's recursive
+  # chown with ENOENT — one such upgrade wiped the app tree and crash-looped
+  # the app. Sweep on every start; the install/upgrade callbacks sweep again
+  # for danglers created while the app was running.
+  dangling="$(find "$TRIM_PKGVAR" -xtype l -print -delete 2>/dev/null | wc -l)"
+  if [ "${dangling:-0}" -gt 0 ]; then
+    log_msg "removed $dangling dangling symlink(s) under $TRIM_PKGVAR (upgrade-chown guard)"
+  fi
+
+  # Marketplace bootstrap before dsh boots — first boot composes the web
+  # profile immediately, so the plugin rows must already be in place. With
+  # the online model this may run the actual `dsh plugin add` install here
+  # (first boot on a device with network; offline falls back to a bare
+  # profile and retries next start).
+  ensure_market
+
+  # Market catalog cache: the panel answers from the local disk copy while
+  # the cache refreshes the origin in the background (see catalog-cache.mjs
+  # for why the origin cannot be accelerated any other way from CN networks).
+  # Override file $TRIM_PKGVAR/market-registry holds the origin URL; writing
+  # "off" there disables the cache entirely.
+  ensure_market_cache
+  resolve_market_cache_url
+
   if ! pid_alive "$DSH_PID_FILE"; then
-    log_msg "Starting dsh web on 127.0.0.1:$DSH_PORT (cwd $WORKSPACE_DIR)"
-    (
-      cd "$WORKSPACE_DIR" || exit 1
-      # The directory picker defaults to os.homedir(); without HOME the dsh
-      # user's passwd entry (/home/dsh) does not exist on fnOS. Pointing HOME
-      # at the shared workspace also makes "~" land in the user-visible share.
-      # npm/XDG caches are redirected so tooling dotdirs stay out of the share.
-      export HOME="$WORKSPACE_DIR"
-      export XDG_CACHE_HOME="$DSH_HOME_DIR/.xdg/cache"
-      export XDG_CONFIG_HOME="$DSH_HOME_DIR/.xdg/config"
-      export XDG_DATA_HOME="$DSH_HOME_DIR/.xdg/data"
-      export npm_config_cache="$DSH_HOME_DIR/.npm-cache"
-      mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$npm_config_cache" 2>/dev/null || true
-      DSH_HOME="$DSH_HOME_DIR" exec node "$DSH_BIN" web --port "$DSH_PORT"
-    ) >> "$LOG_FILE" 2>&1 &
-    echo $! > "$DSH_PID_FILE"
+    launch_dsh_web
   fi
 
   if ! pid_alive "$RELAY_PID_FILE"; then
-    log_msg "Starting gateway relay on $SOCKET_PATH"
-    rm -f "$SOCKET_PATH"
-    (
-      exec node "$RELAY_BIN" --socket "$SOCKET_PATH" --target "127.0.0.1:$DSH_PORT" --prefix "$GATEWAY_PREFIX"
-    ) >> "$LOG_FILE" 2>&1 &
-    echo $! > "$RELAY_PID_FILE"
+    launch_relay
+  fi
+
+  # Watchdog: a broken web profile (a plugin that hangs or dies at load, a
+  # hand-edited patch layer) takes dsh web down before it ever listens —
+  # silently, leaving nothing but ECONNREFUSED in the relay log. Recovery is
+  # two-stage so one bad plugin only costs itself (see boot_web_with_watchdog).
+  # Only a failure of the second stage is fatal. DSH_BOOT_TIMEOUT tunes the
+  # patience per attempt (default 180s; slow boxes may need more).
+  if ! boot_web_with_watchdog; then
+    return 1
   fi
 
   local count=0
@@ -106,6 +629,13 @@ start_app() {
     echo "relay socket did not appear; see $LOG_FILE" > "$TRIM_TEMP_LOGFILE"
     return 1
   fi
+
+  # Last, the between-starts supervision: crash self-healing and tracked
+  # restarts for the market's restart button. A flag left over from a run
+  # whose supervisor died would fire a surprise restart now — this IS the
+  # fresh boot that flag was asking for, so drop it.
+  rm -f "$RESTART_FLAG"
+  start_supervisor
   return 0
 }
 
@@ -130,9 +660,14 @@ stop_one() {
 }
 
 stop_app() {
+  # The supervisor first, as a whole process group: it relaunches things, and
+  # a restart it triggered mid-flight must not respawn anything after this
+  # stop. Then relay, then web (with the stray sweep so nothing holds 3080).
+  stop_group "$SUPERVISOR_PID_FILE" "web supervisor"
+  stop_one "$MARKET_CACHE_PID_FILE" "market catalog cache"
   stop_one "$RELAY_PID_FILE" "relay"
-  stop_one "$DSH_PID_FILE" "dsh web"
-  rm -f "$SOCKET_PATH"
+  stop_web_only
+  rm -f "$SOCKET_PATH" "$RESTART_FLAG"
 }
 
 case "$1" in
@@ -147,6 +682,26 @@ case "$1" in
       exit 0
     fi
     exit 3
+    ;;
+  # Internal: used by supervise-web.sh (and by an admin via
+  # `touch $TRIM_PKGVAR/restart-web`) to restart dsh web under full
+  # supervision — never forwarded to dshmarket's own self-restart.
+  supervised-restart)
+    supervised_restart "${2:-}"
+    ;;
+  # Internal: relaunch the gateway relay if its pid is gone (supervisor
+  # self-healing; the web stays untouched).
+  relaunch-relay)
+    if pid_alive "$RELAY_PID_FILE"; then
+      exit 0
+    fi
+    launch_relay
+    local_count=0
+    while [ ! -S "$SOCKET_PATH" ] && [ "$local_count" -lt 30 ]; do
+      sleep 1
+      local_count=$((local_count + 1))
+    done
+    [ -S "$SOCKET_PATH" ]
     ;;
   *)
     echo "Unknown command: $1" > "$TRIM_TEMP_LOGFILE"

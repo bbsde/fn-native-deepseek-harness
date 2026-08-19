@@ -87,10 +87,12 @@ for arch in $DSH_ARCHS; do
   esac
   echo "=== Building architecture: ${arch} (manifest platform=${pkg_platform}) ==="
 
-  # Same-version rebuilds skip the remote install when the runtime tree for
-  # that version+arch is already staged in cache/.
-  staged=$(node -p "try{require('./cache/dsh-runtime-${arch}/package.json').dependencies['@deepseek-ai/dsh']}catch{''}" 2>/dev/null || true)
-  if [ "$staged" = "$version" ] && [ -f "cache/dsh-runtime-${arch}/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
+  # Same-version rebuilds skip the install when the runtime tree is already
+  # staged. The whole dependency set is compared (dsh + pnpm; the market
+  # plugin is no longer vendored — it installs online at first boot), so
+  # bumping any pin in package.json re-fetches the tree.
+  staged=$(node -p "try{const d=require('./cache/dsh-runtime-${arch}/package.json').dependencies,p=require('./package.json');JSON.stringify(d)===JSON.stringify({'@deepseek-ai/dsh':p.dshVersion,pnpm:p.pnpmVersion})}catch{false}" 2>/dev/null || true)
+  if [ "$staged" = true ] && [ -f "cache/dsh-runtime-${arch}/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
     echo "Runtime for ${version} (${arch}) already staged; skipping install."
   else
     DSH_ARCH="$arch" node scripts/fetch-dsh.mjs

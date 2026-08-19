@@ -35,6 +35,38 @@ if (typeof version !== 'string' || version === '') {
   process.exit(1)
 }
 
+// A pnpm for the `dsh plugin add` machinery rides in the same runtime tree
+// (tooling, not a plugin: it stays vendored so first-boot online installs
+// never depend on the host shipping pnpm). dshmarket itself is NOT vendored:
+// the market installs online into the profile on first boot, so self-updates
+// persist (see src/app/bin/seed-market.mjs and cmd/main).
+const pnpmVersion = pkg.pnpmVersion
+if (typeof pnpmVersion !== 'string' || pnpmVersion === '') {
+  console.error('package.json is missing the pinned "pnpmVersion" field')
+  process.exit(1)
+}
+const stagingManifest = () => ({
+  name: 'dsh-runtime',
+  private: true,
+  dependencies: {
+    '@deepseek-ai/dsh': version,
+    pnpm: pnpmVersion,
+  },
+})
+
+// Registry selection: nas31 and the fnOS-local build sit behind CN networks
+// where registry.npmjs.org crawls (a cold 535-package install took ~10 min
+// there, dominated by tarball downloads). Those paths default to Alibaba's
+// npmmirror; CI's US runners keep npmjs. DSH_NPM_REGISTRY overrides, and the
+// mirror preset also points node-gyp's header download at the npmmirror
+// node dist so node-pty's compile never waits on nodejs.org.
+const NPM_MIRROR = 'https://registry.npmmirror.com'
+const NPM_DEFAULT = 'https://registry.npmjs.org'
+const mirrorEnv = {
+  npm_config_registry: NPM_MIRROR,
+  NODEJS_ORG_MIRROR: 'https://npmmirror.com/mirrors/node/',
+}
+
 // DSH_ARCH selects the target CPU architecture of the runtime tree. This
 // matters because node-pty/koffi/ripgrep ship architecture-specific native
 // binaries. fnOS packages are single-arch (manifest platform=x86|arm), so the
@@ -78,20 +110,22 @@ if ((localBuild && !isArm) || nativeArm) {
   fs.rmSync(dest, { recursive: true, force: true })
   fs.mkdirSync(dest, { recursive: true })
   fs.mkdirSync(path.join(root, 'cache', 'npm-cache'), { recursive: true })
-  fs.writeFileSync(
-    path.join(dest, 'package.json'),
-    JSON.stringify({ name: 'dsh-runtime', private: true, dependencies: { '@deepseek-ai/dsh': version } }),
-  )
-  console.log(`Installing @deepseek-ai/dsh@${version} locally (${nodePlatformArch}, node ${runtimeBin ? '24 (nodejs_v24)' : process.versions.node}) ...`)
+  fs.writeFileSync(path.join(dest, 'package.json'), JSON.stringify(stagingManifest()))
+  // fnOS nodejs_v24 present -> this is the CN NAS box: default to the mirror.
+  const onFnos = runtimeBin !== null
+  const registry = process.env.DSH_NPM_REGISTRY ?? (onFnos ? NPM_MIRROR : NPM_DEFAULT)
+  console.log(`Installing @deepseek-ai/dsh@${version} locally (${nodePlatformArch}, node ${runtimeBin ? '24 (nodejs_v24)' : process.versions.node}, registry ${registry}) ...`)
   const env = {
     ...process.env,
     npm_config_cache: path.join(root, 'cache', 'npm-cache'),
+    npm_config_registry: registry,
     // node-pty compiles from source (no linux-x64 prebuilds in the tarball);
     // node-gyp mkdirs its cache under XDG_CACHE_HOME and downloads node headers
     // into its devdir — both must stay inside the workspace cache on fnOS,
     // where the ambient XDG paths point at the app's own DSH_HOME state.
     XDG_CACHE_HOME: path.join(root, 'cache', 'xdg-cache'),
     npm_config_devdir: path.join(root, 'cache', 'node-gyp'),
+    ...(registry === NPM_MIRROR ? mirrorEnv : {}),
     ...(runtimeBin ? { PATH: `${runtimeBin}:${process.env.PATH}` } : {}),
   }
   run('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: dest, env })
@@ -103,21 +137,26 @@ if ((localBuild && !isArm) || nativeArm) {
   console.error('arm64 builds are produced by GitHub Actions (ubuntu-24.04-arm runner); local arm64 builds require a native arm64 host (DSH_BUILD_HOST=local on arm64).')
   process.exit(1)
 } else {
+  // nas31 sits behind a CN network: default the remote install to npmmirror.
+  const registry = process.env.DSH_NPM_REGISTRY ?? NPM_MIRROR
+  const nodeMirror = registry === NPM_MIRROR ? 'https://npmmirror.com/mirrors/node/' : 'https://nodejs.org/download/release/'
   const remoteScript = `
 set -e
 runtime=/var/apps/nodejs_v24/target
 [ -x "\$runtime/bin/npm" ] || { echo 'nodejs_v24 runtime missing on build host' >&2; exit 1; }
 rm -rf '${remoteDir}'
 mkdir -p '${remoteDir}'
-printf '%s' '${JSON.stringify({ name: 'dsh-runtime', private: true, dependencies: { '@deepseek-ai/dsh': version } })}' > '${remoteDir}/package.json'
+printf '%s' '${JSON.stringify(stagingManifest())}' > '${remoteDir}/package.json'
 cd '${remoteDir}'
 export PATH="\$runtime/bin:\$PATH"
+export npm_config_registry='${registry}'
+export NODEJS_ORG_MIRROR='${nodeMirror}'
 npm install --omit=dev --no-audit --no-fund --loglevel=error
 tar czf runtime.tar.gz package.json node_modules
 ls -la runtime.tar.gz
 `
 
-  console.log(`Installing @deepseek-ai/dsh@${version} on ${host} (linux-x64, node 24) ...`)
+  console.log(`Installing @deepseek-ai/dsh@${version} on ${host} (linux-x64, node 24, registry ${registry}) ...`)
   // stdin must be a pipe for `input` to reach bash -s.
   run('ssh', [host, 'bash -s'], { stdio: ['pipe', 'inherit', 'inherit'], input: remoteScript })
 
@@ -167,4 +206,11 @@ if (!fs.existsSync(path.join(dest, 'node_modules', 'koffi', 'package.json'))) {
   console.error('koffi package missing from the runtime tree')
   process.exit(1)
 }
-console.log(`dsh entry OK; node-pty ${nodePlatformArch} ELF OK (${path.relative(dest, pty)})`)
+
+// Bundled toolchain check: the pnpm that `dsh plugin add` shells out to.
+// rewrite-dist.mjs and cmd/main both assume it is here.
+if (!fs.existsSync(path.join(dest, 'node_modules', 'pnpm', 'package.json'))) {
+  console.error('pnpm package missing from the runtime tree')
+  process.exit(1)
+}
+console.log(`dsh entry OK; node-pty ${nodePlatformArch} ELF OK (${path.relative(dest, pty)}); pnpm OK`)

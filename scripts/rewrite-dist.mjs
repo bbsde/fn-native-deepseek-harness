@@ -5,12 +5,13 @@
  * so without this step requests escape the prefix and the fnOS gateway
  * answers 404 before they ever reach dsh.
  *
- * Two artifact families carry these URLs:
+ * Two artifact families are touched:
  *   1. @deepseek-ai/dsh-web-frontend/dist — the shell (index.html, assets,
  *      manifest.webmanifest)
- *   2. every @deepseek-ai/* package declaring a web `dsh.client` bundle —
- *      served at runtime as /plugins/<package>/client.js; the RPC transport's
- *      "/api" constants live there, not in the shell
+ *   2. every package declaring a web `dsh.client` bundle (served at runtime
+ *      as /plugins/<package>/client.js; the RPC transport's "/api" constants
+ *      live there, not in the shell) — this includes the vendored dshmarket,
+ *      whose panel RPC posts to "/dsh-market/…" routes
  *
  * This is a build-time patch over upstream artifacts, deliberately not a
  * source fork. Every rule is verified: the build fails loudly when a pattern
@@ -74,8 +75,17 @@ const MANIFEST_LINK = /<link\s+rel="manifest"\s+href="[^"]*manifest\.webmanifest
 const CHANNEL_PATTERN_RULE = [
   [String.raw`/^\/[A-Za-z0-9._~-]+$/`, String.raw`/^\/[A-Za-z0-9._~\/-]+$/`],
 ]
+
+// dshmarket's client-bundle rewrites (the "/dsh-market/…" panel RPC routes
+// and the raw.githubusercontent.com/github.com avatar CDN fetches) used to be
+// baked here in the vendored era. The market now installs ONLINE at first
+// boot, so its client arrives at run time — those rules live in the relay
+// (src/app/bin/relay.mjs JS_RULES) and apply to any /plugins/* javascript.
+
 const ruleSetsFor = (file) =>
-  file.endsWith('.webmanifest') ? [TEXT_RULES, MANIFEST_RULES] : [TEXT_RULES, CHANNEL_PATTERN_RULE]
+  file.endsWith('.webmanifest')
+    ? [TEXT_RULES, MANIFEST_RULES]
+    : [TEXT_RULES, CHANNEL_PATTERN_RULE]
 
 /** Collect the ./client export target(s) of one package exports map. */
 function clientExportTargets(exportsMap) {
@@ -90,19 +100,30 @@ function clientExportTargets(exportsMap) {
   return values.filter((value) => value.endsWith('.js') && !value.endsWith('.js.map'))
 }
 
-/** All on-disk web client bundles declared by installed @deepseek-ai packages. */
+/** All on-disk web client bundles declared by installed packages (any scope). */
 function discoverClientBundles() {
-  const scopeDir = path.join(runtime, '@deepseek-ai')
   const bundles = []
-  for (const name of fs.readdirSync(scopeDir)) {
-    const pkgFile = path.join(scopeDir, name, 'package.json')
-    if (!fs.existsSync(pkgFile)) continue
+  const probe = (dir, name) => {
+    const pkgFile = path.join(dir, name, 'package.json')
+    if (!fs.existsSync(pkgFile)) return
     const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'))
     const decl = pkg.dsh?.client
-    if (decl?.platform !== 'web') continue
+    if (decl?.platform !== 'web') return
     for (const rel of clientExportTargets(pkg.exports)) {
-      const file = path.join(scopeDir, name, rel)
+      const file = path.join(dir, name, rel)
       if (fs.existsSync(file)) bundles.push(file)
+    }
+  }
+  // Scoped (@deepseek-ai/*, @dsh-market/*) and top-level packages alike:
+  // discovery is driven by the dsh.client declaration, not by who published
+  // the package. .bin and dotfiles have no package.json probe hits.
+  for (const entry of fs.readdirSync(runtime, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+    if (entry.name.startsWith('@')) {
+      const scopeDir = path.join(runtime, entry.name)
+      for (const name of fs.readdirSync(scopeDir)) probe(scopeDir, name)
+    } else {
+      probe(runtime, entry.name)
     }
   }
   return bundles
@@ -140,6 +161,7 @@ function walk(dir, files = []) {
 // --- rewrite ----------------------------------------------------------------
 
 const clientBundles = discoverClientBundles()
+const failures = []
 
 // Same-version rebuilds re-run this script over an already-rewritten tree,
 // where the patterns below no longer match and the count gates would fail.
@@ -150,7 +172,12 @@ const clientBundles = discoverClientBundles()
   const htmlNow = fs.readFileSync(path.join(dist, 'index.html'), 'utf8')
   const connBundle = clientBundles.find((file) => file.includes('dsh-client-connection'))
   const jsNow = connBundle === undefined ? '' : fs.readFileSync(connBundle, 'utf8')
-  if (htmlNow.includes(`"${prefix}/assets/`) && !htmlNow.includes('manifest.webmanifest') && jsNow.includes(`"${prefix}/api`) && jsNow.includes(CHANNEL_PATTERN_RULE[0][1])) {
+  if (
+    htmlNow.includes(`"${prefix}/assets/`) &&
+    !htmlNow.includes('manifest.webmanifest') &&
+    jsNow.includes(`"${prefix}/api`) &&
+    jsNow.includes(CHANNEL_PATTERN_RULE[0][1])
+  ) {
     console.log('Runtime already carries the gateway prefix; rewrite skipped.')
     process.exit(0)
   }
@@ -161,18 +188,19 @@ for (const file of clientBundles) rewriteFile(file, ruleSetsFor(file))
 
 // --- verification -----------------------------------------------------------
 
-const failures = []
-
 // Strip the manifest <link> after the text rules have run, so the regex sees
 // the prefixed href as well as the original. Gated like every other rule: a
-// zero-match means upstream changed the tag and this step silently stopped
-// working, which must fail the build.
+// zero-match on a tree that still references the manifest means upstream
+// changed the tag and this step silently stopped working, which must fail
+// the build. An absent link with no manifest reference at all is a previous
+// pass's strip — idempotent re-runs must not fail on it.
 {
   const file = path.join(dist, 'index.html')
   const html = fs.readFileSync(file, 'utf8')
   const stripped = html.replace(MANIFEST_LINK, '')
-  if (stripped === html) failures.push('index.html: manifest <link> not found — upstream tag format changed')
-  else fs.writeFileSync(file, stripped)
+  if (stripped === html) {
+    if (html.includes('manifest.webmanifest')) failures.push('index.html: manifest <link> not found — upstream tag format changed')
+  } else fs.writeFileSync(file, stripped)
 }
 
 const html = fs.readFileSync(path.join(dist, 'index.html'), 'utf8')
@@ -212,8 +240,8 @@ console.log(`Rewrote ${total} references across ${report.length} files (${client
 if (failures.length > 0) {
   console.error('\nRewrite verification FAILED:')
   for (const failure of failures) console.error(`  - ${failure}`)
-  console.error('\nThe pinned dsh release emits URLs this script does not recognize.')
-  console.error('Inspect the client bundles, adjust the rule sets, and re-run.')
+console.error('\nThe pinned dsh release emits URLs this script does not recognize.')
+console.error('Inspect the client bundles, adjust the rule sets, and re-run.')
   process.exit(1)
 }
 console.log('Verification passed.')

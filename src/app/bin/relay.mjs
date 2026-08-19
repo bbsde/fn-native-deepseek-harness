@@ -14,8 +14,19 @@
  *   - drops accept-encoding so responses are rewritable
  *   - prefixes the root-absolute URLs dsh injects into index.html at request
  *     time (the __DSH_BOOT__ plugin graph under /plugins/)
+ *   - prefixes the root-absolute URLs inside RUNTIME-INSTALLED plugin client
+ *     bundles (javascript under /plugins/, e.g. the online-installed market's
+ *     "/dsh-market/…" panel RPC) and routes its GitHub CDN fetches through
+ *     the acceleration proxy (--gh-proxy)
  *
  * WebSocket upgrades are proxied with the same path/header treatment.
+ *
+ * POST <prefix>/dsh-market/restart is intercepted (when --restart-flag is
+ * given): dshmarket's own self-restart spawns a detached replacement that no
+ * supervisor tracks — the app's dsh.pid goes permanently stale (the app center
+ * then shows "stopped" forever) and the replacement inherits the runtime lib
+ * dir as cwd. Answering with the 202 the market client expects and touching
+ * the flag file lets cmd/main's supervisor perform a tracked restart instead.
  *
  * Usage:
  *   node relay.mjs --socket <path> --target 127.0.0.1:3080 --prefix /app/dsh
@@ -38,6 +49,14 @@ const PREFIX = arg('prefix', '/app/dsh')
 const SOCKET_PATH = arg('socket', '')
 const TCP_PORT = Number(arg('tcp-port', '0'))
 const ALLOW_ANONYMOUS = process.argv.includes('--test-allow-anonymous')
+// Empty (the default, e.g. in local tests) keeps the restart POST forwarded.
+const RESTART_FLAG_PATH = arg('restart-flag', '')
+// Acceleration-proxy root for the market client's GitHub CDN fetches
+// (READMEs, screenshots, avatars — raw.githubusercontent.com and friends do
+// not resolve on CN networks). cmd/main passes its resolved github-accel
+// value so the device-level override reaches this runtime rewrite; "off"
+// disables the CDN rules. Must stay in sync with cmd/main's default.
+const GH_PROXY_ROOT = arg('gh-proxy', 'https://gh-proxy.com/')
 const TARGET = arg('target', '127.0.0.1:3080')
 const colon = TARGET.lastIndexOf(':')
 const BACKEND_HOST = TARGET.slice(0, colon)
@@ -54,6 +73,53 @@ const HTML_RULES = [
   ['"/assets/', `"${PREFIX}/assets/`],
   ['"/favicon', `"${PREFIX}/favicon`],
 ]
+
+// Runtime-installed plugin client bundles (anything served under /plugins/)
+// were never seen at build time, so their root-absolute URLs — panel RPC
+// routes like dshmarket's "/dsh-market/…", generic "/api/…" calls — arrive
+// unprefixed and would miss the gateway prefix. Same quote-anchoring trick
+// as HTML_RULES keeps it idempotent: an already-prefixed value can no longer
+// match. Unlike the build-time rules these carry a trailing slash on every
+// path ("/api/" not "/api"): runtime bundles come from arbitrary plugins,
+// and "/apis/…" or "/apiv2/…" lookalikes must not be mangled.
+const JS_PATH_RULES = [
+  ['"/api/', `"${PREFIX}/api/`],
+  ["'/api/", `'${PREFIX}/api/`],
+  ['`/api/', `\`${PREFIX}/api/`],
+  ['"/assets/', `"${PREFIX}/assets/`],
+  ["'/assets/", `'${PREFIX}/assets/`],
+  ['`/assets/', `\`${PREFIX}/assets/`],
+  ['"/plugins/', `"${PREFIX}/plugins/`],
+  ["'/plugins/", `'${PREFIX}/plugins/`],
+  ['`/plugins/', `\`${PREFIX}/plugins/`],
+  // dshmarket's panel RPC: 22 endpoints, plain double-quoted strings
+  // (verified against the 1.14.x builds; quote variants kept for safety).
+  ['"/dsh-market/', `"${PREFIX}/dsh-market/`],
+  ["'/dsh-market/", `'${PREFIX}/dsh-market/`],
+  ['`/dsh-market/', `\`${PREFIX}/dsh-market/`],
+]
+// dshmarket's detail view pulls READMEs/screenshots from
+// raw.githubusercontent.com and author avatars from github.com DIRECTLY in
+// the browser; on CN networks those hosts do not resolve. github.com/<o>.png
+// is a redirect page the proxy does not rewrite, so avatars go to the direct
+// avatar host instead. Identical to the build-time rules of the vendored
+// era, now applied at runtime.
+// NOTE: plain quotes below on purpose — the avatar rule must match the
+// LITERAL text "${encodeURIComponent(owner)}" as it appears in the bundle,
+// so no template literals here.
+const JS_CDN_RULES = GH_PROXY_ROOT === '' || /^(off|none)$/i.test(GH_PROXY_ROOT)
+  ? []
+  : [
+      ['`https://raw.githubusercontent.com/', '`' + GH_PROXY_ROOT + 'https://raw.githubusercontent.com/'],
+      ['`https://github.com/${encodeURIComponent(owner)}.png?size=96', '`' + GH_PROXY_ROOT + 'https://avatars.githubusercontent.com/${encodeURIComponent(owner)}?size=96'],
+    ]
+
+function rewritePluginJs(body) {
+  let out = body
+  for (const [from, to] of JS_PATH_RULES) out = out.replaceAll(from, to)
+  for (const [from, to] of JS_CDN_RULES) out = out.replaceAll(from, to)
+  return out
+}
 
 // The fnOS desktop serves this page over plain HTTP on a LAN address, which is
 // not a secure context: crypto.randomUUID is undefined there and the dsh
@@ -135,6 +201,23 @@ const server = http.createServer((req, res) => {
     deny(res, 404, 'outside gateway prefix')
     return
   }
+  // The market's self-restart button, rerouted to supervised restarts (see
+  // the header comment). The client only checks "202 + ok" and then polls
+  // /dsh-market/status until the boot id changes — which a tracked restart
+  // satisfies within its 60s patience window.
+  if (RESTART_FLAG_PATH !== '' && req.method === 'POST' && target === '/dsh-market/restart') {
+    req.resume()
+    try {
+      fs.writeFileSync(RESTART_FLAG_PATH, `${new Date().toISOString()}\n`)
+    } catch (error) {
+      log(`could not write the restart flag: ${error.message}`)
+      deny(res, 500, 'could not request a supervised restart')
+      return
+    }
+    res.writeHead(202, { 'content-type': 'application/json' })
+    res.end('{"ok":true}')
+    return
+  }
   const upstream = http.request(
     {
       host: BACKEND_HOST,
@@ -150,6 +233,20 @@ const server = http.createServer((req, res) => {
         upstreamRes.on('data', (chunk) => chunks.push(chunk))
         upstreamRes.on('end', () => {
           const body = rewriteHtml(Buffer.concat(chunks).toString('utf8'))
+          const headers = { ...upstreamRes.headers }
+          delete headers['content-length']
+          delete headers['transfer-encoding']
+          res.writeHead(upstreamRes.statusCode, headers)
+          res.end(body)
+        })
+        upstreamRes.on('error', () => res.destroy())
+      } else if (type.includes('javascript') && target.startsWith('/plugins/')) {
+        // Runtime-installed plugin clients need the gateway prefix baked into
+        // their bundle URLs (see JS_PATH_RULES); buffer, rewrite, forward.
+        const chunks = []
+        upstreamRes.on('data', (chunk) => chunks.push(chunk))
+        upstreamRes.on('end', () => {
+          const body = rewritePluginJs(Buffer.concat(chunks).toString('utf8'))
           const headers = { ...upstreamRes.headers }
           delete headers['content-length']
           delete headers['transfer-encoding']

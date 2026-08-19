@@ -56,19 +56,42 @@ if (rgMachine !== expectedMachine) {
 }
 fs.chmodSync(rgBin, 0o755)
 
-fs.rmSync(out, { force: true })
-fs.mkdirSync(path.dirname(out), { recursive: true })
-
-// Relative paths + cwd: GNU tar reads "D:/..." as host:path (remote tar),
-// so absolute Windows paths must stay out of the argument list.
-const tar = spawnSync(
-  'tar',
-  ['czf', `cache/runtime-${arch}.tar.gz`, '-C', `cache/dsh-runtime-${arch}`, 'package.json', 'node_modules'],
-  { cwd: root, stdio: 'inherit' },
-)
-if (tar.status !== 0) {
-  console.error(`tar failed with status ${tar.status ?? tar.error}`)
-  process.exit(1)
+// Re-tarring the 33k-file staging tree costs minutes on Windows; skip it
+// when the existing tar is newer than every staged file. Any real change
+// invalidates the check naturally: a fresh fetch rebuilds the tree, and
+// rewrite-dist patches are file writes that bump mtimes. lstat keeps
+// symlinks themselves (the link, not its target) — what tar records.
+function newestMtimeUnder(dir) {
+  let newest = 0
+  const visit = (entry) => {
+    const stat = fs.lstatSync(entry)
+    if (stat.mtimeMs > newest) newest = stat.mtimeMs
+    if (stat.isDirectory()) {
+      for (const name of fs.readdirSync(entry)) visit(path.join(entry, name))
+    }
+  }
+  visit(dir)
+  return newest
 }
-const size = fs.statSync(out).size
-console.log(`packed ${path.relative(root, out)} (${(size / 1024 / 1024).toFixed(1)} MB)`)
+
+if (fs.existsSync(out) && newestMtimeUnder(staged) < fs.statSync(out).mtimeMs) {
+  const size = fs.statSync(out).size
+  console.log(`${path.relative(root, out)} is newer than the staged tree; skipping re-pack (${(size / 1024 / 1024).toFixed(1)} MB)`)
+} else {
+  fs.rmSync(out, { force: true })
+  fs.mkdirSync(path.dirname(out), { recursive: true })
+
+  // Relative paths + cwd: GNU tar reads "D:/..." as host:path (remote tar),
+  // so absolute Windows paths must stay out of the argument list.
+  const tar = spawnSync(
+    'tar',
+    ['czf', `cache/runtime-${arch}.tar.gz`, '-C', `cache/dsh-runtime-${arch}`, 'package.json', 'node_modules'],
+    { cwd: root, stdio: 'inherit' },
+  )
+  if (tar.status !== 0) {
+    console.error(`tar failed with status ${tar.status ?? tar.error}`)
+    process.exit(1)
+  }
+  const size = fs.statSync(out).size
+  console.log(`packed ${path.relative(root, out)} (${(size / 1024 / 1024).toFixed(1)} MB)`)
+}

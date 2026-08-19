@@ -17,4 +17,8 @@ rm -rf "$RUNTIME_DIR"
 mkdir -p "$RUNTIME_DIR"
 tar xzf "$RUNTIME_TAR" -C "$RUNTIME_DIR"
 
+# Same guard as upgrade_callback: dangling symlinks anywhere under the data
+# dir abort the appcenter chown walk during upgrades.
+find "$TRIM_PKGVAR" -xtype l -delete 2>/dev/null || true
+
 exit 0

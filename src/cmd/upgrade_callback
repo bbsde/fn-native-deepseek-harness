@@ -14,4 +14,10 @@ rm -rf "$RUNTIME_DIR"
 mkdir -p "$RUNTIME_DIR"
 tar xzf "$RUNTIME_TAR" -C "$RUNTIME_DIR"
 
+# The appcenter upgrade chown-walks TRIM_PKGVAR after the callbacks return;
+# a single dangling symlink (pnpm .bin shims whose packages were removed)
+# fails that walk with ENOENT and aborts the whole upgrade — observed as the
+# app tree wiped and an APP_CRASH loop. Sweep them before handing back.
+find "$TRIM_PKGVAR" -xtype l -delete 2>/dev/null || true
+
 exit 0
