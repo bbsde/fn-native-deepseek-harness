@@ -3,8 +3,8 @@
 把 DeepSeek Harness（dsh，AI Agent 框架）打包成飞牛 fnOS 原生应用（.fpk）的工程。
 上游：https://github.com/deepseek-ai/deepseek-harness （MIT，npm 包 `@deepseek-ai/dsh`）。
 
-命名约定：**应用标识一律用 `dsh`**（appname、网关前缀 `/app/dsh`、运行用户 `dsh`、共享目录
-`dsh/workspace`、显示名 `DS·H`）；只有仓库名保留全称 fn-native-deepseek-harness。
+命名约定：**应用标识一律用 `dsh`**（appname、网关前缀 `/app/dsh`、运行用户 `dsh`、共享根
+`dsh`（下分 `workspace/` 与 `home/`）、显示名 `DS·H`）；只有仓库名保留全称 fn-native-deepseek-harness。
 
 ## 架构（为什么长这样）
 
@@ -24,23 +24,46 @@
         → dsh web（127.0.0.1:3080，永远只绑回环）
 ```
 
-数据布局（**不要**把 DSH_HOME 放共享目录）：
+数据布局（**用户数据全在共享目录，@appdata 只放可再生文件**——卸载/升级失败/重装失败
+都不会丢配置、插件和会话）：
 
-- `DSH_HOME=$TRIM_PKGVAR/dsh`（即 `/vol1/@appdata/dsh/dsh`）：`.credentials.yaml`
-  （上游强制 owner-only 权限位，放共享目录会拒绝启动）、profiles/（可执行插件代码）、会话与设置。
+- 共享根 `dsh`（data-share 声明，实际在 `/vol1/@appshare/dsh`，Windows ACL 权限模型：
+  平台以**命名 ACL 条目**授权 dsh 用户，属主类留空）：
+  - `dsh/home/` = DSH_HOME：`.credentials.yaml`、settings.yaml、profiles/（插件代码）、
+    会话、market-present stamp。管理员覆盖文件 `github-accel`、`npm-registry`、
+    `market-registry` 也在这里，**文件管理器可直接编辑**（cmd/main 读共享优先、
+    @appdata 旧位置兜底）。
+  - `dsh/workspace/`：agent 工作目录。cmd/main 启动 dsh 前 `cd` 进去，新会话 cwd 默认取
+    `process.getcwd()`，产出文件天然落在共享区，文件管理器可见。
+- `TRIM_PKGVAR`（/vol1/@appdata/dsh）只放可再生状态：`runtime/`（install_callback 从 fpk
+  解压）、`bin/` shims（seed-market 每次启动重生成）、`lastgood-web` 快照（回滚机械，
+  非用户数据）、`market-cache/`、`.npm-cache`、`.xdg`、pid/log/flag。
+- **credentials chmod 守卫（必须每次启动都跑，不能省）**：共享目录新建文件的 POSIX mode
+  形态不可预测（0600 原子写实测 stat 回 `060` 或 `000`——权限都在命名 ACL 里，mode 位
+  不反映真实访问），而上游 `assertOwnerOnly` 见 group/other 位即拒启。cmd/main 的
+  `dsh_launch_env` 每次拉 dsh 前对 `$DSH_HOME/.credentials.yaml` 跑 `chmod 600`（实测
+  能拉正且 dsh 仍可读写）；面板每次保存 Key 都原子重建该文件，所以守卫不能只做一次。
+- **pnpm store 路径守卫（同上，每次启动都跑）**：pnpm 把 store 的**绝对路径**写死在 profile
+  的 `node_modules/.modules.yaml`（storeDir 字段，JSON 或 YAML 形态都可能出现），与当前
+  store 不一致时该 profile 内一切 install/update 直接 `ERR_PNPM_UNEXPECTED_STORE` 拒绝
+  （市场自更新就是这么挂的，0.1.1-rc.2.1 迁移设备实锤）。布局重构把 store 从旧 home 挪到
+  `$TRIM_PKGVAR/.xdg/data/pnpm/store`，迁移过来的 profile 全部带着旧路径。cmd/main 的
+  `repair_pnpm_stores()`（start 与 supervised restart 时跑）把 storeDir 重指到当前 store 根
+  （保留 vNN 版本后缀）；store 是内容寻址缓存，新位置缺什么 pnpm 自己重拉。**XDG_DATA_HOME
+  的根若变更，该函数里的 store_root 字面量必须同步**。
+- **迁移**：老安装 `$TRIM_PKGVAR/dsh`（旧 home）由 cmd/main start 的 `migrate_home_to_share`
+  一次性搬到共享 `home/`（tar 保 mode、排除缓存、覆盖文件 copy 过去、搬完删旧目录）；
+  失败保留旧目录下次重试。share 型软链 `profiles/node_modules/dshmarket` 清理逻辑不变。
 - dsh 运行时整树以单文件 `src/app/runtime.tar.gz` 进 fpk（33k 文件打成 1 个，安装秒级），
   `cmd/install_callback`/`upgrade_callback` 在安装/升级时解压到 `$TRIM_PKGVAR/runtime`，
   cmd/main 从那里启动 dsh（解压失败的报错会指向重装）。
-- 共享目录 `dsh/workspace`（data-share 声明，实际在 `/vol1/@appshare/dsh/workspace`）：
-  agent 工作目录。cmd/main 启动 dsh 前 `cd` 进去，新会话 cwd 默认取 `process.getcwd()`，
-  产出文件天然落在共享区，文件管理器可见。
-- dsh 进程的 `HOME` 也指向共享 workspace（目录选择器默认列 `os.homedir()`，不设 HOME 会
-  落到不存在的 `/home/dsh` 报 ENOENT）；npm/XDG 缓存重定向到 `$DSH_HOME_DIR` 下避免
-  点文件污染共享区。
+- dsh 进程的 `HOME` 指向共享 workspace（目录选择器默认列 `os.homedir()`，不设 HOME 会
+  落到不存在的 `/home/dsh` 报 ENOENT）；npm/XDG 缓存重定向到 `$TRIM_PKGVAR` 下
+  （缓存可再生，不占共享区）。
 
 关键 TRIM_ 环境变量（实测值）：`TRIM_APPDEST=/vol1/@appcenter/dsh`、
-`TRIM_PKGVAR=/vol1/@appdata/dsh`、`TRIM_DATA_SHARE_PATHS=/vol1/@appshare/dsh/workspace`。
-`/var/apps/dsh/shares/workspace` 是共享目录的软链（注意是 `shares` 不是 `share`）。
+`TRIM_PKGVAR=/vol1/@appdata/dsh`、`TRIM_DATA_SHARE_PATHS=/vol1/@appshare/dsh`。
+`/var/apps/dsh/shares/` 下是共享目录的软链（注意是 `shares` 不是 `share`）。
 
 ## 目录
 
@@ -100,6 +123,18 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
   `DSH_NPM_REGISTRY` 可覆盖。`pack-runtime.mjs` 带新鲜度跳过：cache 里现成 tar 比整棵
   staging 树都新就不重打（33k 文件重打一次要几分钟）——同依赖的封装修订重建因此只要
   秒级（fetch/rewrite/pack 三段全跳，只剩 fnpack）。
+- **npm 解析活锁与 lockfile（0.1.1-rc.2 起）**：npm 11.12 的 arborist 对 dsh 的依赖图
+  有病态回溯——`placeDep` 在 NAS CPU 上 ~2 行/分钟（实测 nas31 与 Windows 开发机都
+  活锁，13 分钟零产出；npmjs/npmmirror、清 cacache、--legacy-peer-deps 均无效），CI
+  能出包纯靠美国 runner 的快 CPU 硬磨。`fetch-dsh.mjs` 因此全面改为 **lockfile 模式**：
+  `ensureLockfile()` 用本机 npm `--package-lock-only` 生成一次预解析锁（快机也要
+  ~35 分钟），存为 `locks/package-lock-<dshVersion>-<pnpmVersion>.json` 并**提交进仓库**
+  （这是构建输入不是缓存——CI 双架构直接复用，装出与本地验证完全一致的确定性依赖树；
+  `cache/` 红线不涉及它）。锁内 resolved URL 一律规范为 npmjs 正典（生成机默认镜像时
+  生成后重写），本地与远程安装路径按各自 registry 就地重写（走 npmmirror 时改写为镜像
+  URL；integrity 哈希不变，镜像字节相同），安装一律 `npm ci` 跳过解析。
+  **升级 dshVersion 后必须删旧锁**（名字带版本对，正常自动失效）；丢了锁文件的下一次
+  构建会重新进入漫长的解析阶段。
 - **fnOS `platform` 字段取值**：`x86`（仅 x86 设备）/ `arm`（仅 ARM 设备）/ `all`（同时支持，但仅当包内不含架构特定二进制时）。本应用内含架构相关的原生模块（node-pty/koffi/ripgrep 都是特定架构的 .node/.so），**不能用 `all`**——必须出两个独立包（`platform=x86` 与 `platform=arm`），分别安装到对应架构设备。
 
 ### 双架构发布（GitHub Actions）
@@ -152,6 +187,15 @@ artifact 只含 `dist/*.fpk`（info.txt 不上传、不进 Release 附件）。
   形式、webmanifest 的 start_url/scope/id）改写为网关前缀，另含市场 runner 跨平台补丁
   （见"内置插件市场"节）。带校验门禁：模式消失/计数异常 → 构建失败。
   **升级 dshVersion 后重写失败时，先检查上游打包方式变化，更新规则集，再重新验证。**
+- **LOOPBACK_RULE（0.1.1-rc.x 起）**：上游把 settings/credentials 特权 RPC 平面的闸门
+  挪到了**客户端**——connection 包的 client.js 用页面自身 `location.hostname` 判回环，
+  网关后面必然非回环 → settings 镜像进 "memory" 模式、一个 RPC 都不发，模型页报
+  "settings are unavailable in this browser"（relay 骗得了服务端 Host 头，骗不了浏览器
+  内部的 location）。规则把该判定钉成 `isLoopback: true`（本 fpk 里浏览器等价回环：
+  请求全部经 relay 回环终结 + 管理员闸门）。门禁是家族标记
+  `isLoopbackHostname(pageLocation.hostname)`——上游改写该表达式形态会触发 fail；
+  上游整个改名（pageLocation 换名）则标记消失、静默不补，升级后要人工确认模型页可用。
+  服务端副本 lib/index.js 的 Host 头 fence 必须保持原样（relay 靠它放行）。
 - glob/grep 工具不用系统 `rg`，而是 spawn 上游 vendor 的
   `node_modules/@vscode/ripgrep-linux-<arch>/bin/rg`——树里唯一必须带执行位的文件
   （.node/.so 走 dlopen 只要读权限）。旧 Windows/MSYS tar 往返构建曾丢过该执行位：
@@ -204,19 +248,20 @@ npm 包 `dshmarket`）的侧边栏插件市场（浏览/搜索/一键安装/更�
 （非 GitHub 域名 403），文件又是 CI 产物（仓库里只有源数据，无 raw 镜像可代），因此
 **加速必须落在本地**：`bin/catalog-cache.mjs` 起 stale-while-revalidate 缓存（只绑
 127.0.0.1:3180，`DSH_MARKET_CACHE_PORT` 可改），cmd/main 通过 `DSHM_REGISTRY_URL` 把
-dshmarket 的取数指过去。面板请求**立即**返回磁盘缓存（`$DSH_HOME/market-cache/`，
+dshmarket 的取数指过去。面板请求**立即**返回磁盘缓存（`$TRIM_PKGVAR/market-cache/`，
 重启后第一次也秒回），后台按 5 分钟节流向源站刷新（180s 预算，覆盖实测最差链路）；源站
 挂了继续服务最后一份好目录（NAS 场景的取舍：昨天的目录好过 30 秒转圈）；只有拉到合法
 目录（含非空 plugins 数组）才覆盖缓存，坏响应不会污染好副本。冷启动且源站拉不到时按
 dshmarket 的耐心上限回 503（面板显示可重试错误，与上游行为一致）。缓存服务死了自动退
 回上游直连（cmd/main 探 healthz，不通就不注入）。换源/关闭：`echo <URL或off> | sudo tee
-/vol1/@appdata/dsh/market-registry` 后重启应用。契约测试 `scripts/test-catalog-cache.mjs`。
+/vol1/@appshare/dsh/home/market-registry`（或文件管理器直接编辑共享里的同名文件）后重启
+应用。契约测试 `scripts/test-catalog-cache.mjs`。
 
 - **插件安装走国内源**：cmd/main 给 dsh 进程（及其 pnpm 子进程）export
   `npm_config_registry=https://registry.npmmirror.com`（`NODEJS_ORG_MIRROR` 同步指向
   npmmirror 的 node 头文件，带原生依赖的插件编译不再等 nodejs.org）。镜像出问题时
   （如刚发布的包还没同步）：`echo https://registry.npmjs.org | sudo tee
-  /vol1/@appdata/dsh/npm-registry` 后重启应用即回官方源。
+  /vol1/@appshare/dsh/home/npm-registry` 后重启应用即回官方源。
 - **市场详情页的 GitHub 资源也走代理（relay 运行期重写）**：dshmarket 的 client 直接在
   浏览器里拉 `raw.githubusercontent.com` 的 README/截图和 `github.com/<owner>.png` 头像，
   CN 网络下 DNS 全挂（控制台一片 ERR_NAME_NOT_RESOLVED / ERR_CONNECTION_RESET）→
@@ -233,7 +278,7 @@ dshmarket 的耐心上限回 503（面板显示可重试错误，与上游行为
      Node 进程，在 https.request/fetch 层把 codeload 地址改写到代理（实测 pnpm 10 走
      node:https）。两层都只影响本应用进程树，不碰 NAS 全局配置；dsh agent 自己的
      clone/下载也会被加速。第三方代理有信任成本，换地址/禁用：
-     `echo https://ghproxy.net/ | sudo tee /vol1/@appdata/dsh/github-accel`（写代理根地址，
+     `echo https://ghproxy.net/ | sudo tee /vol1/@appshare/dsh/home/github-accel`（写代理根地址，
      带 https 和尾斜杠；也接受已含 github.com 的完整前缀；置空或写 off 即关）后重启应用。
   gh-proxy.org 是 gh-proxy.com 的 301 别名（同一服务），填哪个效果一样、.com 少一跳。
   `api.github.com` 的元数据请求（star 数等）不在改写范围。
@@ -311,7 +356,7 @@ ssh nas31 'sudo curl -s --unix-socket /vol1/@appcenter/dsh/app.sock \
   180s，`DSH_BOOT_TIMEOUT` 可调），失败且存在 web profile 时按序两级恢复：
   1. **外科手术（salvage，`bin/profile-salvage.mjs`）**：每次成功启动后把 profile 的
      输入文件（package.json / pnpm-workspace.yaml / cordis.patch.yml / pnpm-lock.yaml）
-     快照到 `$DSH_HOME/lastgood-web`；启动失败时先 park 整个 profile，把输入文件换回
+     快照到 `$TRIM_PKGVAR/lastgood-web`；启动失败时先 park 整个 profile，把输入文件换回
      快照、删掉快照之后新装的插件的 node_modules、删合成的 cordis.yml，再启动。
      dsh boot 纯按 manifest 的 `dsh.profile.bundles` 加载（reconcilePlugins 只在
      `dsh plugin` 命令时跑，boot 不扫 node_modules），所以恢复 manifest 即可让坏插件
@@ -369,4 +414,7 @@ curl 检查要点：无 `X-Trim-Isadmin` → 403；带 admin + 任意 Host → 2
 - 不要把 `cache/`（构建缓存）和 `src/app/runtime.tar.gz`（构建产物）提交进仓库。
 - Git Bash 下传 `/app/...` 之类参数给 node 时加 `MSYS_NO_PATHCONV=1`，否则参数被路径转换污染；
   node 脚本里远程命令一律走 `spawnSync('ssh', [host,'bash -s'], {input})`，别过 Windows shell。
-- 上游 `.credentials.yaml` 强制 owner-only 权限位——DSH_HOME 永远放 `TRIM_PKGVAR`。
+- 上游 `.credentials.yaml` 强制 owner-only POSIX 权限位，而共享目录的 mode 位形态不可控
+  （命名 ACL 授权）——**守卫不可删**：dsh_launch_env 每次启动前 `chmod 600` 该文件；
+  移动/新增任何"启动 dsh"的代码路径都必须先过守卫。缓存类文件一律放 `TRIM_PKGVAR`，
+  共享区只放用户数据。

@@ -76,6 +76,24 @@ const CHANNEL_PATTERN_RULE = [
   [String.raw`/^\/[A-Za-z0-9._~-]+$/`, String.raw`/^\/[A-Za-z0-9._~\/-]+$/`],
 ]
 
+// 0.1.1-rc.x gates the settings/credentials RPC plane client-side: the
+// connection bundle classifies the page by its own location.hostname, and a
+// non-loopback page — always the case behind the fnOS gateway, where the app
+// lives at http://<nas-lan-ip>/app/dsh — builds every settings consumer in
+// "memory" mode, so no settings.* RPC is ever sent and the Models page dies
+// with "settings are unavailable in this browser". location is browser-
+// internal state no proxy can rewrite, and behind the relay every browser
+// request terminates on loopback behind an admin-gated gateway, which makes
+// the page loopback-equivalent — so the classification is pinned to true.
+// Server-side copies (lib/index.js) must stay untouched: their Host-header
+// fence is what the relay satisfies by rewriting Host/Origin.
+const LOOPBACK_RULE = [
+  [
+    'isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),',
+    'isLoopback: true,',
+  ],
+]
+
 // dshmarket's client-bundle rewrites (the "/dsh-market/…" panel RPC routes
 // and the raw.githubusercontent.com/github.com avatar CDN fetches) used to be
 // baked here in the vendored era. The market now installs ONLINE at first
@@ -85,7 +103,7 @@ const CHANNEL_PATTERN_RULE = [
 const ruleSetsFor = (file) =>
   file.endsWith('.webmanifest')
     ? [TEXT_RULES, MANIFEST_RULES]
-    : [TEXT_RULES, CHANNEL_PATTERN_RULE]
+    : [TEXT_RULES, CHANNEL_PATTERN_RULE, LOOPBACK_RULE]
 
 /** Collect the ./client export target(s) of one package exports map. */
 function clientExportTargets(exportsMap) {
@@ -165,9 +183,9 @@ const failures = []
 
 // Same-version rebuilds re-run this script over an already-rewritten tree,
 // where the patterns below no longer match and the count gates would fail.
-// Detect that state by the prefixed forms themselves and skip. The widened
-// channel pattern must be present too, so a tree rewritten before the
-// CHANNEL_PATTERN_RULE existed still receives the missing regex fix.
+// Detect that state by the patched forms themselves and skip. The widened
+// channel pattern and the pinned loopback flag must be present too, so a tree
+// rewritten before either rule existed still receives the missing patch.
 {
   const htmlNow = fs.readFileSync(path.join(dist, 'index.html'), 'utf8')
   const connBundle = clientBundles.find((file) => file.includes('dsh-client-connection'))
@@ -176,7 +194,8 @@ const failures = []
     htmlNow.includes(`"${prefix}/assets/`) &&
     !htmlNow.includes('manifest.webmanifest') &&
     jsNow.includes(`"${prefix}/api`) &&
-    jsNow.includes(CHANNEL_PATTERN_RULE[0][1])
+    jsNow.includes(CHANNEL_PATTERN_RULE[0][1]) &&
+    !jsNow.includes(LOOPBACK_RULE[0][0])
   ) {
     console.log('Runtime already carries the gateway prefix; rewrite skipped.')
     process.exit(0)
@@ -216,6 +235,13 @@ if (connectionBundle === undefined) {
   }
   if (!contents.includes(CHANNEL_PATTERN_RULE[0][1])) {
     failures.push('dsh-client-connection client bundle: channel pattern not widened for the multi-segment prefix (generic RPC would throw client-side)')
+  }
+  // Family marker, looser than the rule's exact `from`: any surviving shape
+  // of the page-location classification (upstream renamed a local, the rule
+  // stopped matching) means the settings plane is dead behind the gateway.
+  // Absent entirely in much older upstreams, which is not a failure.
+  if (contents.includes('isLoopbackHostname(pageLocation.hostname)')) {
+    failures.push('dsh-client-connection client bundle: page-location loopback classification not pinned (settings would be unavailable behind the gateway)')
   }
 }
 

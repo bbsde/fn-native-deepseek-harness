@@ -10,7 +10,8 @@ GATEWAY_PREFIX="/app/${APPNAME}"
 # Overridable for parallel test instances on a device (production: 3080).
 DSH_PORT="${DSH_PORT:-3080}"
 
-DSH_HOME_DIR="${TRIM_PKGVAR}/dsh"
+# Pre-share home location; start_app migrates it onto the share once.
+OLD_HOME_DIR="${TRIM_PKGVAR}/dsh"
 LOG_FILE="${TRIM_PKGVAR}/app.log"
 DSH_PID_FILE="${TRIM_PKGVAR}/dsh.pid"
 RELAY_PID_FILE="${TRIM_PKGVAR}/relay.pid"
@@ -28,7 +29,9 @@ MARKET_SEED_BIN="${TRIM_APPDEST}/bin/seed-market.mjs"
 # start_app): snapshots the web profile's input files after every successful
 # boot so a later broken-plugin boot can be repaired by restoring them.
 SALVAGE_BIN="${TRIM_APPDEST}/bin/profile-salvage.mjs"
-LASTGOOD_DIR="${DSH_HOME_DIR}/lastgood-web"
+# Rollback snapshots are boot machinery, not user data — they live (and may
+# die) with the volatile @appdata tree, keeping the share user-clean.
+LASTGOOD_DIR="${TRIM_PKGVAR}/lastgood-web"
 # Loopback stale-while-revalidate cache for the market's plugin catalog. From
 # CN networks the origin (GitHub Pages) throttles the ~1.25 MB catalog to
 # 12-138 s per full fetch while dshmarket budgets 15 s x2 — see
@@ -53,13 +56,20 @@ MAIN_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
 export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
 
-# New sessions inherit the launch cwd as their project directory, so dsh is
-# started from the shared workspace: agent output lands in a user-visible
-# share instead of the private app tree.
-WORKSPACE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
-if [ -z "${WORKSPACE_DIR}" ]; then
-  WORKSPACE_DIR="/var/apps/${APPNAME}/shares/workspace"
+# Everything a user would mourn (API keys, settings, plugin profiles,
+# sessions) lives on the shared dsh directory so it survives any @appdata
+# wipe — failed upgrades, uninstall+reinstall, future fnOS semantics. The
+# @appdata tree keeps only regenerable state: the runtime tarball extraction,
+# caches, pids, logs, rollback snapshots. One declared share is the root;
+# workspace/ is the agent cwd (new sessions inherit it, output lands in the
+# file manager), home/ is DSH_HOME.
+SHARE_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
+if [ -z "$SHARE_ROOT" ]; then
+  SHARE_ROOT="/var/apps/${APPNAME}/shares"
 fi
+SHARE_ROOT="${SHARE_ROOT%/}"
+WORKSPACE_DIR="${SHARE_ROOT}/workspace"
+DSH_HOME_DIR="${SHARE_ROOT}/home"
 
 log_msg() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
@@ -114,13 +124,70 @@ seed_market() {
     || log_msg "market seed reported problems (non-fatal)"
 }
 
+# fnOS shares grant the app user through NAMED ACL entries, so files created
+# there come out with unpredictable classic mode bits (a fresh 0600 atomic
+# write can stat as 060 or even 000), and upstream dsh refuses to boot while
+# .credentials.yaml shows any group/other bit. Normalize before every launch:
+# the file is atomically REPLACED on each key save, so this must run on every
+# boot, not once at install.
+guard_credentials_mode() {
+  [ -f "${DSH_HOME_DIR}/.credentials.yaml" ] || return 0
+  chmod 600 "${DSH_HOME_DIR}/.credentials.yaml" 2>>"$LOG_FILE" || true
+}
+
+# pnpm hard-codes the absolute store dir inside a profile's
+# node_modules/.modules.yaml, and any mismatch with the store pnpm would use
+# now aborts every install/update in that profile with ERR_PNPM_UNEXPECTED_
+# STORE — the market's self-update included (verified on-device). The share
+# rework moved that store: the old layout kept it under the pre-share home,
+# the current one puts it with the other volatile caches under
+# $TRIM_PKGVAR/.xdg (the base dsh_launch_env exports as XDG_DATA_HOME — keep
+# the two in sync). Profiles migrated from the old layout therefore boot fine
+# but cannot take plugin updates until re-pointed. The store is a
+# content-addressed cache: pnpm re-fetches anything the new location lacks.
+repair_pnpm_stores() {
+  [ -d "${DSH_HOME_DIR}/profiles" ] || return 0
+  local store_root="${TRIM_PKGVAR}/.xdg/data/pnpm/store"
+  local my suffix have want
+  while IFS= read -r -d '' my; do
+    # pnpm serializes .modules.yaml as JSON on this tree but plain YAML on
+    # others; accept both storeDir shapes.
+    have="$(sed -n 's|.*"storeDir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$my" | head -n 1)"
+    [ -n "$have" ] || have="$(sed -n 's|^[[:space:]]*storeDir:[[:space:]]*\([^\r[:space:]]*\).*$|\1|p' "$my" | head -n 1)"
+    case "$have" in
+      */pnpm/store/v[0-9]*) ;;
+      *) continue ;;
+    esac
+    suffix="${have##*/pnpm/store/}"
+    want="${store_root}/${suffix}"
+    [ "$have" != "$want" ] || continue
+    if sed -i "s|${have}|${want}|g" "$my" 2>>"$LOG_FILE"; then
+      log_msg "re-pointed pnpm store in ${my#${DSH_HOME_DIR}/profiles/} (${have} -> ${want})"
+    fi
+  done < <(find "${DSH_HOME_DIR}/profiles" -maxdepth 3 -name .modules.yaml -print0 2>/dev/null)
+  return 0
+}
+
+# Admin override files (github-accel, npm-registry, market-registry) live on
+# the home share where the file manager can edit them; the legacy @appdata
+# location still answers when the share copy is absent (pre-migration devices).
+override_file() {
+  if [ -f "${DSH_HOME_DIR}/$1" ]; then
+    echo "${DSH_HOME_DIR}/$1"
+  else
+    echo "${TRIM_PKGVAR}/$1"
+  fi
+}
+
 # The GitHub acceleration root ("" = off), re-read from the override file on
 # every call so relay relaunches pick up device-level changes. Shared by the
 # dsh process env and the relay's --gh-proxy so the two never drift.
 github_accel_root() {
   local accel="https://gh-proxy.com/"
-  if [ -f "${TRIM_PKGVAR}/github-accel" ]; then
-    accel="$(head -n 1 "${TRIM_PKGVAR}/github-accel" | tr -d '[:space:]')"
+  local override
+  override="$(override_file github-accel)"
+  if [ -f "$override" ]; then
+    accel="$(head -n 1 "$override" | tr -d '[:space:]')"
   fi
   case "$accel" in
     ""|off|none) echo "" ;;
@@ -135,15 +202,20 @@ github_accel_root() {
 # identically to a cold start.
 dsh_launch_env() {
   cd "$WORKSPACE_DIR" || return 1
+  # The share grants dsh access through ACL entries, not owner bits, so a
+  # credentials file freshly written there can carry group bits in its mode
+  # and upstream would refuse to boot. Normalize on every launch.
+  guard_credentials_mode
   # The directory picker defaults to os.homedir(); without HOME the dsh
   # user's passwd entry (/home/dsh) does not exist on fnOS. Pointing HOME
   # at the shared workspace also makes "~" land in the user-visible share.
-  # npm/XDG caches are redirected so tooling dotdirs stay out of the share.
+  # npm/XDG caches are volatile by nature: they stay in @appdata so the
+  # share only ever holds user-meaningful state.
   export HOME="$WORKSPACE_DIR"
-  export XDG_CACHE_HOME="$DSH_HOME_DIR/.xdg/cache"
-  export XDG_CONFIG_HOME="$DSH_HOME_DIR/.xdg/config"
-  export XDG_DATA_HOME="$DSH_HOME_DIR/.xdg/data"
-  export npm_config_cache="$DSH_HOME_DIR/.npm-cache"
+  export XDG_CACHE_HOME="${TRIM_PKGVAR}/.xdg/cache"
+  export XDG_CONFIG_HOME="${TRIM_PKGVAR}/.xdg/config"
+  export XDG_DATA_HOME="${TRIM_PKGVAR}/.xdg/data"
+  export npm_config_cache="${TRIM_PKGVAR}/.npm-cache"
   # The marketplace's one-click install resolves bare `dsh`/`pnpm` from
   # PATH; seed-market.mjs maintains those shims in $TRIM_PKGVAR/bin.
   export PATH="${TRIM_PKGVAR}/bin:$PATH"
@@ -156,8 +228,10 @@ dsh_launch_env() {
   #   echo https://registry.npmjs.org | sudo tee $TRIM_PKGVAR/npm-registry
   # then restart the app.
   local market_registry="https://registry.npmmirror.com"
-  if [ -f "${TRIM_PKGVAR}/npm-registry" ]; then
-    market_registry="$(head -n 1 "${TRIM_PKGVAR}/npm-registry" | tr -d '[:space:]')"
+  local registry_override
+  registry_override="$(override_file npm-registry)"
+  if [ -f "$registry_override" ]; then
+    market_registry="$(head -n 1 "$registry_override" | tr -d '[:space:]')"
   fi
   export npm_config_registry="$market_registry"
   export NODEJS_ORG_MIRROR="https://npmmirror.com/mirrors/node/"
@@ -275,8 +349,10 @@ ensure_market_cache() {
   [ -f "$MARKET_CACHE_BIN" ] || return 0
   pid_alive "$MARKET_CACHE_PID_FILE" && return 0
   local market_origin="https://awesome-dsh-plugin.com/plugins.json"
-  if [ -f "${TRIM_PKGVAR}/market-registry" ]; then
-    market_origin="$(head -n 1 "${TRIM_PKGVAR}/market-registry" | tr -d '[:space:]')"
+  local origin_override
+  origin_override="$(override_file market-registry)"
+  if [ -f "$origin_override" ]; then
+    market_origin="$(head -n 1 "$origin_override" | tr -d '[:space:]')"
   fi
   case "$market_origin" in
     ""|off|none)
@@ -286,7 +362,7 @@ ensure_market_cache() {
       log_msg "Starting market catalog cache on 127.0.0.1:$MARKET_CACHE_PORT (origin $market_origin)"
       (
         exec node "$MARKET_CACHE_BIN" --port "$MARKET_CACHE_PORT" --origin "$market_origin" \
-          --cache-dir "${DSH_HOME_DIR}/market-cache"
+          --cache-dir "${TRIM_PKGVAR}/market-cache"
       ) >> "$LOG_FILE" 2>&1 &
       echo $! > "$MARKET_CACHE_PID_FILE"
       ;;
@@ -531,6 +607,7 @@ supervised_restart() {
     log_msg "removed $count dangling symlink(s) under $TRIM_PKGVAR (upgrade-chown guard)"
   fi
   parent_alive "$parent" || { log_msg "supervisor gone; aborting the restart"; return 1; }
+  repair_pnpm_stores
   ensure_market
   ensure_market_cache
   resolve_market_cache_url
@@ -551,7 +628,8 @@ start_supervisor() {
   fi
   log_msg "Starting web supervisor (poll every ${DSH_SUPERVISE_POLL:-5}s)"
   (
-    export TRIM_PKGVAR TRIM_APPDEST DSH_PORT LOG_FILE SUPERVISOR_PID_FILE MAIN_BIN="$MAIN_SELF"
+    export TRIM_PKGVAR TRIM_APPDEST TRIM_DATA_SHARE_PATHS DSH_PORT LOG_FILE \
+      SUPERVISOR_PID_FILE MAIN_BIN="$MAIN_SELF"
     export DSH_SUPERVISE_POLL="${DSH_SUPERVISE_POLL:-5}" DSH_BOOT_TIMEOUT="${DSH_BOOT_TIMEOUT:-180}"
     if command -v setsid >/dev/null 2>&1; then
       exec setsid bash "$SUPERVISOR_BIN"
@@ -561,12 +639,48 @@ start_supervisor() {
   echo $! > "$SUPERVISOR_PID_FILE"
 }
 
+# One-time move of the pre-share home (credentials, settings, profiles,
+# sessions) from @appdata onto the dsh/home share. Runs at start — after the
+# platform has created the share (its existence at upgrade_callback time is
+# not guaranteed), before anything reads the home. Caches are left behind to
+# die with the old directory. A failed migration logs loudly and lets the
+# boot continue: dsh re-seeds what it can, and the old copy stays untouched
+# for manual recovery until a later start retries.
+migrate_home_to_share() {
+  [ -d "$OLD_HOME_DIR" ] || return 0
+  [ -f "${OLD_HOME_DIR}/.credentials.yaml" ] || [ -d "${OLD_HOME_DIR}/profiles" ] || {
+    rm -rf "$OLD_HOME_DIR"
+    return 0
+  }
+  mkdir -p "$DSH_HOME_DIR" 2>>"$LOG_FILE" || return 1
+  log_msg "migrating dsh home from $OLD_HOME_DIR to the share ($DSH_HOME_DIR)"
+  if ! (cd "$OLD_HOME_DIR" && tar cf - \
+      --exclude=./.npm-cache --exclude=./.xdg --exclude=./market-cache \
+      --exclude=./lastgood-web .) \
+    | (cd "$DSH_HOME_DIR" && tar xf -) >> "$LOG_FILE" 2>&1; then
+    log_msg "home migration FAILED; keeping $OLD_HOME_DIR in place and booting the share home as-is (retry next start)"
+    return 1
+  fi
+  # Admin overrides move onto the share too (reads prefer the share copy);
+  # the @appdata originals stay behind as the fallback location.
+  local f
+  for f in github-accel npm-registry market-registry; do
+    if [ -f "${TRIM_PKGVAR}/$f" ]; then
+      cp -p "${TRIM_PKGVAR}/$f" "${DSH_HOME_DIR}/$f" 2>>"$LOG_FILE" || true
+    fi
+  done
+  rm -rf "$OLD_HOME_DIR"
+  guard_credentials_mode
+  find "$TRIM_PKGVAR" -xtype l -delete 2>/dev/null || true
+}
+
 start_app() {
   if status_app; then
     return 0
   fi
 
-  mkdir -p "$DSH_HOME_DIR"
+  mkdir -p "$DSH_HOME_DIR" 2>>"$LOG_FILE" || true
+  migrate_home_to_share
   if [ ! -d "$WORKSPACE_DIR" ]; then
     mkdir -p "$WORKSPACE_DIR" 2>/dev/null || true
   fi
@@ -586,6 +700,8 @@ start_app() {
     log_msg "removed $dangling dangling symlink(s) under $TRIM_PKGVAR (upgrade-chown guard)"
   fi
 
+  repair_pnpm_stores
+
   # Marketplace bootstrap before dsh boots — first boot composes the web
   # profile immediately, so the plugin rows must already be in place. With
   # the online model this may run the actual `dsh plugin add` install here
@@ -596,8 +712,8 @@ start_app() {
   # Market catalog cache: the panel answers from the local disk copy while
   # the cache refreshes the origin in the background (see catalog-cache.mjs
   # for why the origin cannot be accelerated any other way from CN networks).
-  # Override file $TRIM_PKGVAR/market-registry holds the origin URL; writing
-  # "off" there disables the cache entirely.
+  # The override file (github-accel-style, share home first) holds the origin
+  # URL; writing "off" there disables the cache entirely.
   ensure_market_cache
   resolve_market_cache_url
 

@@ -91,6 +91,41 @@ const run = (command, args, options = {}) => {
   }
 }
 
+// npm 11.12's arborist crawls through dsh >= 0.1.1-rc.2's dependency graph
+// (placeDep at ~2 lines/min on a NAS CPU — a livelock for practical purposes;
+// the CI builds only succeeded because fast runner CPUs grind through the
+// same pathology). A pre-resolved package-lock.json skips resolution
+// entirely: resolve it ONCE on the local (fast) machine, track it in locks/
+// by (dshVersion, pnpmVersion) — the staging manifest pins both exactly, so
+// a stored lock always matches; CI reuses the committed copy, which makes
+// both architecture builds install the exact tree verified locally — and
+// let every install path run `npm ci`.
+const lockFile = () => path.join(root, 'locks', `package-lock-${version}-${pnpmVersion}.json`)
+
+function ensureLockfile() {
+  const lock = lockFile()
+  if (fs.existsSync(lock)) {
+    console.log(`Using dependency lock ${path.relative(root, lock)}`)
+    return lock
+  }
+  const genDir = path.join(root, 'cache', 'lockgen')
+  fs.rmSync(genDir, { recursive: true, force: true })
+  fs.mkdirSync(genDir, { recursive: true })
+  fs.writeFileSync(path.join(genDir, 'package.json'), JSON.stringify(stagingManifest()))
+  console.log(`Resolving the dependency lock for dsh@${version} (npm placeDep is pathologically slow on this graph; expect several minutes even on a fast machine) ...`)
+  run('npm', ['install', '--package-lock-only', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: genDir })
+  fs.mkdirSync(path.join(root, 'locks'), { recursive: true })
+  // Canonicalize to npmjs resolved-URLs: a machine whose npm defaults to the
+  // mirror would bake mirror URLs into the tracked lock. Install paths below
+  // rewrite to whichever registry they fetch through, so the stored copy
+  // always carries the upstream URLs.
+  const generated = fs.readFileSync(path.join(genDir, 'package-lock.json'), 'utf8')
+  fs.writeFileSync(lock, generated.replaceAll('https://registry.npmmirror.com/', 'https://registry.npmjs.org/'))
+  fs.rmSync(genDir, { recursive: true, force: true })
+  return lock
+}
+
+
 // On a native arm64 host (GitHub's ubuntu-24.04-arm runner) the runtime tree
 // installs directly with the ambient npm. There is no emulated-container path
 // any more: local x86 hosts cannot build arm64 (use CI).
@@ -114,6 +149,15 @@ if ((localBuild && !isArm) || nativeArm) {
   // fnOS nodejs_v24 present -> this is the CN NAS box: default to the mirror.
   const onFnos = runtimeBin !== null
   const registry = process.env.DSH_NPM_REGISTRY ?? (onFnos ? NPM_MIRROR : NPM_DEFAULT)
+  // The tracked lock carries npmjs URLs (see ensureLockfile); npm ci fetches
+  // tarballs by the lock's resolved URLs, so mirror installs get the same
+  // rewrite the remote path applies. Integrity hashes verify either way —
+  // the mirror serves identical bytes.
+  const lockSource = fs.readFileSync(ensureLockfile(), 'utf8')
+  const lockJson = registry === NPM_MIRROR
+    ? lockSource.replaceAll('registry.npmjs.org', 'registry.npmmirror.com')
+    : lockSource
+  fs.writeFileSync(path.join(dest, 'package-lock.json'), lockJson)
   console.log(`Installing @deepseek-ai/dsh@${version} locally (${nodePlatformArch}, node ${runtimeBin ? '24 (nodejs_v24)' : process.versions.node}, registry ${registry}) ...`)
   const env = {
     ...process.env,
@@ -128,7 +172,7 @@ if ((localBuild && !isArm) || nativeArm) {
     ...(registry === NPM_MIRROR ? mirrorEnv : {}),
     ...(runtimeBin ? { PATH: `${runtimeBin}:${process.env.PATH}` } : {}),
   }
-  run('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: dest, env })
+  run('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: dest, env })
 } else if (isArm) {
   // arm64 builds happen on GitHub Actions' native arm64 runner (see
   // .github/workflows/build.yml). Building arm64 on a local x86 host used to
@@ -140,6 +184,14 @@ if ((localBuild && !isArm) || nativeArm) {
   // nas31 sits behind a CN network: default the remote install to npmmirror.
   const registry = process.env.DSH_NPM_REGISTRY ?? NPM_MIRROR
   const nodeMirror = registry === NPM_MIRROR ? 'https://npmmirror.com/mirrors/node/' : 'https://nodejs.org/download/release/'
+  // The tracked lock carries canonical npmjs URLs; when fetching through the
+  // mirror, rewrite them so tarballs come from the fast path too. Integrity
+  // hashes still verify: the mirror serves the identical tarball bytes.
+  const lockSource = fs.readFileSync(ensureLockfile(), 'utf8')
+  const lockJson = registry === NPM_MIRROR
+    ? lockSource.replaceAll('registry.npmjs.org', 'registry.npmmirror.com')
+    : lockSource
+  const lockB64 = Buffer.from(lockJson, 'utf8').toString('base64').replace(/(.{76})/g, '$1\n')
   const remoteScript = `
 set -e
 runtime=/var/apps/nodejs_v24/target
@@ -147,12 +199,15 @@ runtime=/var/apps/nodejs_v24/target
 rm -rf '${remoteDir}'
 mkdir -p '${remoteDir}'
 printf '%s' '${JSON.stringify(stagingManifest())}' > '${remoteDir}/package.json'
+base64 -d > '${remoteDir}/package-lock.json' <<'DSH_LOCK_B64'
+${lockB64}
+DSH_LOCK_B64
 cd '${remoteDir}'
 export PATH="\$runtime/bin:\$PATH"
 export npm_config_registry='${registry}'
 export NODEJS_ORG_MIRROR='${nodeMirror}'
-npm install --omit=dev --no-audit --no-fund --loglevel=error
-tar czf runtime.tar.gz package.json node_modules
+npm ci --omit=dev --no-audit --no-fund --loglevel=error
+tar czf runtime.tar.gz package.json package-lock.json node_modules
 ls -la runtime.tar.gz
 `
 
