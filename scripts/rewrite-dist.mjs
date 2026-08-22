@@ -105,6 +105,179 @@ const ruleSetsFor = (file) =>
     ? [TEXT_RULES, MANIFEST_RULES]
     : [TEXT_RULES, CHANNEL_PATTERN_RULE, LOOPBACK_RULE]
 
+// --- fnOS authorized-directory virtual browsing (directory picker) -----------
+// fnOS volumes mount with trimacl: a「配置访问权限」grant gives the app user
+// read/write inside the granted directory (kernel-enforced) but only traverse
+// (--x) on the ancestor layers — opendir there always fails with EACCES, and
+// posix ACLs are NOT executed on trimacl volumes, so the listing right cannot
+// be granted with setfacl/chmod (fn-native-moviepilot proved this across
+// three releases). The picker host backend below is therefore patched to
+// synthesize the next hop of the granted chain whenever a listing dies on
+// permissions. The grant list (DSH_ACCESSIBLE_PATHS_FILE →
+// $TRIM_PKGVAR/accessible-paths, written by cmd/config_callback from
+// TRIM_DATA_ACCESSIBLE_PATHS) is re-read on every listing, so authorization
+// changes apply without a restart. Absent list / no grant under the path →
+// upstream behavior stands.
+const pickerPath = path.join(
+  runtime, '@deepseek-ai', 'dsh-host-directory-picker-browse', 'lib', 'index.js'
+)
+const pickerMarker = 'fnosGrantHopRows'
+const pickerFilterMarker = 'fnosRowEnterable'
+const pickerAlreadyPatched = () =>
+  fs.existsSync(pickerPath)
+  && fs.readFileSync(pickerPath, 'utf8').includes(pickerMarker)
+  && fs.readFileSync(pickerPath, 'utf8').includes(pickerFilterMarker)
+
+const PICKER_IMPORT_ANCHOR =
+  'import { mkdir, opendir, stat } from "node:fs/promises";'
+const PICKER_DOC_ANCHOR =
+  '/** The `ctx.directoryPicker` browse implementation (stable capability object per service life). */'
+const PICKER_TRUNCATED_ANCHOR = '\t\tlet truncated = evicted;'
+const PICKER_ROW_ANCHOR = [
+  '\t\t\tconst row = await directoryRow(target, candidate.name, candidate.isDirectory, candidate.isSymbolicLink, signal);',
+  '\t\t\tif (row === null) continue;',
+].join('\n')
+const PICKER_CATCH_ANCHOR = [
+  '\t\t} catch (error) {',
+  '\t\t\tsignal?.throwIfAborted();',
+  '\t\t\tthrow new DirectoryPickerError("directory-unreadable", target, `cannot list ${target}: ${messageOf(error)}`);',
+  '\t\t}',
+].join('\n')
+const PICKER_EXPORT_ANCHOR =
+  'export { boundedInsert, BrowseDirectoryPicker as default, fullyQualified, raceAbort };'
+// Tab-indented to match the file; exported for the contract test
+// (scripts/test-picker-grant-hops.mjs).
+const PICKER_HOPS_FN = [
+  '/**',
+  '* fnOS trimacl volumes leave the ancestor layers of a 配置访问权限 grant',
+  '* traverse-only (--x): opendir there fails with EACCES, so the picker can',
+  '* never walk down to the granted directory. These fn-native packaging shims',
+  '* consult the DSH_ACCESSIBLE_PATHS_FILE grant list (one absolute path per',
+  '* line, maintained by cmd/config_callback and re-read on every listing, so',
+  '* authorization changes apply without a restart).',
+  '*/',
+  'function fnosGrantRoots() {',
+  '\tconst grantsFile = process.env.DSH_ACCESSIBLE_PATHS_FILE;',
+  '\tif (!grantsFile) return [];',
+  '\tlet raw;',
+  '\ttry {',
+  '\t\traw = readFileSync(grantsFile, "utf8");',
+  '\t} catch {',
+  '\t\treturn [];',
+  '\t}',
+  '\tconst roots = [];',
+  '\tfor (let line of raw.split("\\n")) {',
+  '\t\tline = line.trim();',
+  '\t\tif (!line.startsWith("/")) continue;',
+  '\t\troots.push(line.length > 1 && line.endsWith("/") ? line.slice(0, -1) : line);',
+  '\t}',
+  '\treturn roots;',
+  '}',
+  '/**',
+  '* Rows for the next hops of the granted chains under target, or null when',
+  '* no grant lives there (the upstream unreadable-directory error stands).',
+  '*/',
+  'function fnosGrantHopRows(target) {',
+  '\tconst base = target.length > 1 && target.endsWith("/") ? target.slice(0, -1) : target;',
+  '\tconst prefix = base === "/" ? "/" : base + "/";',
+  '\tconst hops = new Set();',
+  '\tfor (const root of fnosGrantRoots()) {',
+  '\t\tif (!root.startsWith(prefix)) continue;',
+  '\t\tconst hop = root.slice(prefix.length).split("/")[0];',
+  '\t\tif (hop !== "") hops.add(hop);',
+  '\t}',
+  '\tif (hops.size === 0) return null;',
+  '\treturn [...hops].sort((left, right) => left.localeCompare(right)).map((hop) => ({',
+  '\t\tname: hop,',
+  '\t\tpath: base === "/" ? "/" + hop : base + "/" + hop,',
+  '\t\thidden: hop.startsWith(".")',
+  '\t}));',
+  '}',
+  '/**',
+  '* Whether a listed directory row should stay visible: fnOS grants rarely',
+  '* cover a whole level, so real listings are full of directories this app',
+  '* cannot open — hide them instead of offering rows that error on click.',
+  '* Directories on the chain TOWARD a granted directory are exempt: they are',
+  '* traverse-only by design (the hop synthesis handles their listing), so the',
+  '* access probe would wrongly hide the only path down to the grant.',
+  '*/',
+  'async function fnosRowEnterable(rowPath, roots) {',
+  '\tfor (const root of roots) {',
+  '\t\tif (root === rowPath || root.startsWith(rowPath.endsWith("/") ? rowPath : rowPath + "/")) return true;',
+  '\t}',
+  '\ttry {',
+  '\t\tawait access(rowPath, constants.R_OK | constants.X_OK);',
+  '\t\treturn true;',
+  '\t} catch {',
+  '\t\treturn false;',
+  '\t}',
+  '}',
+  '',
+  '',
+].join('\n')
+
+function patchPickerGrants(failures) {
+  if (!fs.existsSync(pickerPath)) {
+    failures.push(
+      'dsh-host-directory-picker-browse/lib/index.js not found — upstream layout changed, the authorized-directory browsing patch needs a new anchor'
+    )
+    return
+  }
+  if (pickerAlreadyPatched()) {
+    report.push({ file: pickerPath, hits: [{ from: 'fnos grant shims (already present)', count: 0 }] })
+    return
+  }
+  const original = fs.readFileSync(pickerPath, 'utf8')
+  const replacements = [
+    [PICKER_IMPORT_ANCHOR, [
+      'import { access, mkdir, opendir, stat } from "node:fs/promises";',
+      'import { constants, readFileSync } from "node:fs";',
+    ].join('\n')],
+    [PICKER_DOC_ANCHOR, PICKER_HOPS_FN + PICKER_DOC_ANCHOR],
+    [PICKER_CATCH_ANCHOR, PICKER_CATCH_ANCHOR.replace(
+      '\t\t\tthrow new DirectoryPickerError("directory-unreadable", target, `cannot list ${target}: ${messageOf(error)}`);',
+      [
+        '\t\t\tconst fnosHops = fnosGrantHopRows(target);',
+        '\t\t\tif (fnosHops !== null) return {',
+        '\t\t\t\tpath: target,',
+        '\t\t\t\thome,',
+        '\t\t\t\tcrumbs: ancestryCrumbs(target),',
+        '\t\t\t\tentries: fnosHops,',
+        '\t\t\t\ttruncated: false',
+        '\t\t\t};',
+        '\t\t\tthrow new DirectoryPickerError("directory-unreadable", target, `cannot list ${target}: ${messageOf(error)}`);',
+      ].join('\n')
+    )],
+    [PICKER_TRUNCATED_ANCHOR, [
+      PICKER_TRUNCATED_ANCHOR,
+      '\t\tconst fnosRoots = fnosGrantRoots();',
+    ].join('\n')],
+    [PICKER_ROW_ANCHOR, [
+      PICKER_ROW_ANCHOR,
+      '\t\t\tif (!await fnosRowEnterable(row.path, fnosRoots)) continue;',
+    ].join('\n')],
+    [PICKER_EXPORT_ANCHOR, PICKER_EXPORT_ANCHOR.replace(
+      'fullyQualified, raceAbort };',
+      'fnosGrantHopRows, fnosGrantRoots, fnosRowEnterable, fullyQualified, raceAbort };'
+    )],
+  ]
+  let out = original
+  const hits = []
+  for (const [from, to] of replacements) {
+    const count = out.split(from).length - 1
+    if (count !== 1) {
+      failures.push(
+        `dsh-host-directory-picker-browse: anchor matched ${count} times (expected 1): ${JSON.stringify(from.slice(0, 70))}…`
+      )
+      return
+    }
+    out = out.replace(from, to)
+    hits.push({ from: from.slice(0, 50), count })
+  }
+  fs.writeFileSync(pickerPath, out)
+  report.push({ file: pickerPath, hits })
+}
+
 /** Collect the ./client export target(s) of one package exports map. */
 function clientExportTargets(exportsMap) {
   const entry = exportsMap?.['./client']
@@ -184,8 +357,9 @@ const failures = []
 // Same-version rebuilds re-run this script over an already-rewritten tree,
 // where the patterns below no longer match and the count gates would fail.
 // Detect that state by the patched forms themselves and skip. The widened
-// channel pattern and the pinned loopback flag must be present too, so a tree
-// rewritten before either rule existed still receives the missing patch.
+// channel pattern, the pinned loopback flag and the picker grant patch must
+// be present too, so a tree rewritten before any of those rules existed
+// still receives the missing patch.
 {
   const htmlNow = fs.readFileSync(path.join(dist, 'index.html'), 'utf8')
   const connBundle = clientBundles.find((file) => file.includes('dsh-client-connection'))
@@ -195,7 +369,8 @@ const failures = []
     !htmlNow.includes('manifest.webmanifest') &&
     jsNow.includes(`"${prefix}/api`) &&
     jsNow.includes(CHANNEL_PATTERN_RULE[0][1]) &&
-    !jsNow.includes(LOOPBACK_RULE[0][0])
+    !jsNow.includes(LOOPBACK_RULE[0][0]) &&
+    pickerAlreadyPatched()
   ) {
     console.log('Runtime already carries the gateway prefix; rewrite skipped.')
     process.exit(0)
@@ -204,6 +379,7 @@ const failures = []
 
 for (const file of walk(dist)) rewriteFile(file, ruleSetsFor(file))
 for (const file of clientBundles) rewriteFile(file, ruleSetsFor(file))
+patchPickerGrants(failures)
 
 // --- verification -----------------------------------------------------------
 
@@ -242,6 +418,19 @@ if (connectionBundle === undefined) {
   // Absent entirely in much older upstreams, which is not a failure.
   if (contents.includes('isLoopbackHostname(pageLocation.hostname)')) {
     failures.push('dsh-client-connection client bundle: page-location loopback classification not pinned (settings would be unavailable behind the gateway)')
+  }
+}
+
+// The picker grant patch must be wired, not just present: the list() catch
+// arm has to consult the hop builder before throwing the unreadable error,
+// and the row loop has to filter inaccessible directories.
+if (fs.existsSync(pickerPath)) {
+  const pickerContents = fs.readFileSync(pickerPath, 'utf8')
+  if (!pickerContents.includes('const fnosHops = fnosGrantHopRows(target);')) {
+    failures.push('dsh-host-directory-picker-browse: authorized-directory hop synthesis not wired into list() (grant browsing would stay broken)')
+  }
+  if (!pickerContents.includes('if (!await fnosRowEnterable(row.path, fnosRoots)) continue;')) {
+    failures.push('dsh-host-directory-picker-browse: inaccessible-row filtering not wired into list() (dead rows would still show)')
   }
 }
 

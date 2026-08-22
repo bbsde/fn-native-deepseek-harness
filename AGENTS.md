@@ -295,6 +295,32 @@ dshmarket 的耐心上限回 503（面板显示可重试错误，与上游行为
 - 市场内安装只接受 awesome-dsh-plugin 目录里收录的包（上游的安全设计）。
 - skill 型/git 源安装依赖主机 `git`；`github:` 源走 pnpm 整仓下载，慢网下有超时重试。
 
+## 授权目录（fnOS「配置访问权限」→ 目录选择器虚拟浏览）
+
+fnOS 卷以 trimacl（btrfs 自定义 ACL）挂载。给应用授权目录（应用设置 → 配置访问权限）
+后：**授权目录本体**由 trimacl 内核层授读写（真实可用），**祖先层只给 `--x` 穿透权**
+（可进不可列）；而 posix ACL（setfacl/chmod）在 trimacl 卷上**不被内核执行**——
+getfacl 可见、实际不生效，祖先层的列举权授不出来（fn-native-moviepilot 三个版本
+实证过，勿再走 setfacl 路线）。症状：目录选择器点开 `/volN` 层报 directory-unreadable，
+永远走不到授权目录。
+
+解法（与 moviepilot 3.0.0.13 终版同构）——**虚拟浏览**：
+
+- 数据流：fnOS 配置钩子 `cmd/config_callback` 收 `TRIM_DATA_ACCESSIBLE_PATHS`
+  （冒号分隔），落盘 `$TRIM_PKGVAR/accessible-paths`（一行一个现存目录）。变量为空
+  = 普通配置表单回传，不动现有文件。
+- cmd/main 的 `dsh_launch_env` 导出 `DSH_ACCESSIBLE_PATHS_FILE` 指向该文件
+  （文件不存在 = 未配置授权，补丁保持上游行为）。
+- 构建期补丁 `rewrite-dist.mjs` 的 `patchPickerGrants()`（锚点+计数门禁，上游结构
+  变化即构建失败）改写 `dsh-host-directory-picker-browse/lib/index.js`：`list()`
+  的 catch 在列举失败时调 `fnosGrantHopRows(target)`——当前目录是某授权目录的祖先时
+  合成授权链下一跳虚拟目录（授权目录本体及内部仍是真实列举），否则保持上游报错。
+  **每次列举重读授权文件，授权变更即时生效、无需重启**。真实列举同时过滤无权打开的
+  子目录（`fnosRowEnterable`：access R_OK|X_OK 探测，点开必报错的行直接不显示）；
+  通往授权目录的链路目录豁免——它们本就「可穿不可列」，不豁免会被探测器误杀。
+- 契约测试 `scripts/test-picker-grant-hops.mjs`（跳层计算 + `list()` 上游行为不回归；
+  EACCES 分支本身无法在非 fnOS 平台复现，接线靠 rewrite-dist 的字符串门禁）。
+
 ## 开发测试生命周期（平台：nas31）
 
 **出包后不主动 scp 到测试机**：fpk 留在 `dist/` 即可，用户自己通过 fnOS 桌面页面上传安装

@@ -216,6 +216,11 @@ dsh_launch_env() {
   export XDG_CONFIG_HOME="${TRIM_PKGVAR}/.xdg/config"
   export XDG_DATA_HOME="${TRIM_PKGVAR}/.xdg/data"
   export npm_config_cache="${TRIM_PKGVAR}/.npm-cache"
+  # fnOS「配置访问权限」授权清单（cmd/config_callback 维护）：trimacl 只给
+  # 授权目录祖先层穿透权，目录选择器的虚拟浏览补丁（rewrite-dist.mjs 的
+  # patchPickerGrants）按这份清单在无列举权的层合成下一跳。每次列举重读，
+  # 授权变更即时生效；文件不存在 = 未配置授权，补丁保持上游行为。
+  export DSH_ACCESSIBLE_PATHS_FILE="${TRIM_PKGVAR}/accessible-paths"
   # The marketplace's one-click install resolves bare `dsh`/`pnpm` from
   # PATH; seed-market.mjs maintains those shims in $TRIM_PKGVAR/bin.
   export PATH="${TRIM_PKGVAR}/bin:$PATH"

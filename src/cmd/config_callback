@@ -1,0 +1,41 @@
+#!/bin/bash
+#
+# config_callback — 配置变更后调用（root 身份）。dsh 只消费一个 fnOS 配置源：
+# 「配置访问权限」的授权目录清单（TRIM_DATA_ACCESSIBLE_PATHS，冒号分隔）。
+#
+# fnOS 卷是 trimacl 挂载：授权目录本体由内核层授读写、祖先层仅 --x 穿透
+# （可进不可列），posix ACL（setfacl/chmod）在 trimacl 卷上不被内核执行，
+# 祖先层的列举权授不出来。清单落盘到 $TRIM_PKGVAR/accessible-paths；目录
+# 选择器的构建期补丁（rewrite-dist.mjs 的 patchPickerGrants）据此在无列举
+# 权的层合成授权链下一跳虚拟目录——补丁每次列举都重读本文件，授权变更
+# 即时生效，无需重启应用。
+#
+# 清单缺省（TRIM_DATA_ACCESSIBLE_PATHS 为空 = 普通配置表单回传）时不动
+# 现有文件；幂等：整文件重写。
+set -uo pipefail
+
+DATA_DIR="${TRIM_PKGVAR:?TRIM_PKGVAR missing}"
+APP_USER="${TRIM_USERNAME:-dsh}"
+APP_GROUP="${TRIM_GROUPNAME:-dsh}"
+GRANTS_FILE="${DATA_DIR}/accessible-paths"
+LOG_FILE="${DATA_DIR}/config.log"
+
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE" 2>/dev/null || echo "$*"
+}
+
+dirs="${TRIM_DATA_ACCESSIBLE_PATHS:-}"
+[ -z "$dirs" ] && exit 0
+
+tmp="${GRANTS_FILE}.tmp.$$"
+: > "$tmp" || { log "cannot write ${tmp}; grants NOT updated"; exit 0; }
+IFS=':'
+for d in $dirs; do
+  [ -d "$d" ] && echo "${d%/}" >> "$tmp"
+done
+unset IFS
+chown "${APP_USER}:${APP_GROUP}" "$tmp" 2>/dev/null || true
+chmod 644 "$tmp"
+mv -f "$tmp" "$GRANTS_FILE"
+log "accessible-paths updated ($(grep -c . "$GRANTS_FILE") entries); the directory picker picks them up on its next listing"
+exit 0
