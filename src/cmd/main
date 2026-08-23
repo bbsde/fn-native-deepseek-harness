@@ -56,21 +56,29 @@ MAIN_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
 export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
 
-# Everything a user would mourn (API keys, settings, plugin profiles,
-# sessions) lives on the shared dsh directory so it survives any @appdata
-# wipe — failed upgrades, uninstall+reinstall, future fnOS semantics. The
-# @appdata tree keeps only regenerable state: the runtime tarball extraction,
-# caches, pids, logs, rollback snapshots. The share root IS the dsh home —
-# DSH_HOME, unix HOME and the default session cwd in one place, like a real
-# user home: dotfiles and global state live alongside the agent's work files.
-# (Earlier layouts split home/ and workspace/ subdirectories out of the root;
-# start_app flattens those once.)
+# Three-way layout, each with one job:
+#   @appdata (TRIM_PKGVAR) — regenerable runtime only: the extracted runtime
+#     tree, caches, pids, logs. Safe to reset at any time.
+#   share root — DSH_HOME: harness data (.credentials.yaml, profiles/,
+#     sessions, settings) plus the agent's work files, all visible in the
+#     file manager. The dsh web process runs with cwd here, so new sessions
+#     default their working directory to it.
+#   system home (TRIM_PKGHOME -> /home/dsh) — the dsh ACCOUNT's unix home:
+#     cross-session global state (.gitconfig, .git-credentials, .ssh, shell
+#     history) shared by every session, exactly like a human user's home.
+# Earlier layouts kept the unix home (or a workspace/) inside the share;
+# start_app migrates those forward once.
 SHARE_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
 if [ -z "$SHARE_ROOT" ]; then
   SHARE_ROOT="/var/apps/${APPNAME}/shares"
 fi
 SHARE_ROOT="${SHARE_ROOT%/}"
 DSH_HOME_DIR="${SHARE_ROOT}"
+# The platform provisions TRIM_PKGHOME (/vol1/@apphome/dsh, owned dsh:dsh)
+# at install; the install callbacks symlink /home/dsh -> it because the
+# passwd entry for app accounts points there but nothing creates it (fnOS
+# homes its own accounts/apps the same way — see hermes).
+SYS_HOME_DIR="${TRIM_PKGHOME:-/var/apps/${APPNAME}/home}"
 
 log_msg() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
@@ -207,15 +215,21 @@ dsh_launch_env() {
   # credentials file freshly written there can carry group bits in its mode
   # and upstream would refuse to boot. Normalize on every launch.
   guard_credentials_mode
-  # HOME is the dsh home share: the unix-home for every process in the tree.
-  # Cross-session global state — git credentials (~/.git-credentials via the
-  # seeded credential.helper), agent-written global git config (~/.gitconfig),
-  # shell history, SSH keys — persists there once for ALL sessions, visible
-  # in the file manager. (Without a real home every session had to keep its
-  # own copy of such facts.) New sessions take this same share as their
-  # default cwd (process cwd above); npm/XDG caches stay redirected to
-  # @appdata below.
-  export HOME="$DSH_HOME_DIR"
+  # HOME is the dsh account's system home (/home/dsh -> TRIM_PKGHOME): the
+  # unix-home for every process in the tree. Cross-session global state —
+  # git credentials (~/.git-credentials via the seeded credential.helper),
+  # agent-written global git config (~/.gitconfig), shell history, SSH keys
+  # — persists there once for ALL sessions. (Without a real home every
+  # session had to keep its own copy of such facts.) Prefer the canonical
+  # /home/dsh path so ~, passwd lookups and $HOME agree; fall back to the
+  # physical dir when the symlink is missing (callbacks own it; a reinstall
+  # recreates it). npm/XDG caches stay redirected to @appdata below.
+  export HOME="/home/${APPNAME}"
+  if [ ! -d "$HOME" ]; then
+    export HOME="$SYS_HOME_DIR"
+    mkdir -p "$HOME" 2>>"$LOG_FILE" || true
+    log_msg "NOTE: /home/${APPNAME} missing; HOME falls back to $SYS_HOME_DIR (reinstall recreates the symlink)"
+  fi
   # fnOS app accounts carry /usr/sbin/nologin as their passwd shell; plugins
   # that spawn a terminal (dsh-better-sidebar resolves $SHELL first, then the
   # passwd entry) would exec nologin — "This account is currently not
@@ -728,6 +742,32 @@ migrate_home_to_share() {
   find "$TRIM_PKGVAR" -xtype l -delete 2>/dev/null || true
 }
 
+# rc.2.11 briefly used the share root as the unix HOME too; the system home
+# (TRIM_PKGHOME) took that role back. One-time move of the unix-global
+# dotfiles out of the share root into the system home — allowlisted names
+# only (harness data like .credentials.yaml must stay in DSH_HOME), skip on
+# collision and leave the share copy for manual sorting. Cross-device move
+# is fine; these are small files.
+migrate_home_state() {
+  [ -d "$DSH_HOME_DIR" ] || return 0
+  mkdir -p "$SYS_HOME_DIR" 2>>"$LOG_FILE" || return 1
+  local name moved=0
+  for name in .gitconfig .git-credentials .ssh .bash_history .bashrc .profile .local .lesshst .viminfo; do
+    if [ ! -e "${DSH_HOME_DIR}/${name}" ] && [ ! -L "${DSH_HOME_DIR}/${name}" ]; then
+      continue
+    fi
+    if [ -e "${SYS_HOME_DIR}/${name}" ] || [ -L "${SYS_HOME_DIR}/${name}" ]; then
+      log_msg "home migration: ${name} already exists in the system home; share copy left in place"
+      continue
+    fi
+    if mv "${DSH_HOME_DIR}/${name}" "${SYS_HOME_DIR}/${name}" 2>>"$LOG_FILE"; then
+      moved=$((moved + 1))
+    fi
+  done
+  [ "$moved" -gt 0 ] && log_msg "home migration: moved $moved dotfile item(s) from the share root into the system home"
+  return 0
+}
+
 # Earlier layouts kept the dsh home in <share>/home and the agent cwd in
 # <share>/workspace; the share root itself is home now. One-time flatten of
 # both subdirectories' contents into the root (a plain mv per top-level item
@@ -761,9 +801,10 @@ start_app() {
     return 0
   fi
 
-  mkdir -p "$DSH_HOME_DIR" 2>>"$LOG_FILE" || true
+  mkdir -p "$DSH_HOME_DIR" "$SYS_HOME_DIR" 2>>"$LOG_FILE" || true
   flatten_share_layout
   migrate_home_to_share
+  migrate_home_state
   if [ ! -f "$DSH_BIN" ]; then
     log_msg "dsh entry missing: $DSH_BIN"
     echo "dsh runtime not extracted; reinstall the app (see $LOG_FILE)" > "$TRIM_TEMP_LOGFILE"

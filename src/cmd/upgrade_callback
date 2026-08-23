@@ -20,4 +20,10 @@ tar xzf "$RUNTIME_TAR" -C "$RUNTIME_DIR"
 # app tree wiped and an APP_CRASH loop. Sweep them before handing back.
 find "$TRIM_PKGVAR" -xtype l -delete 2>/dev/null || true
 
+# Refresh the /home/<name> -> TRIM_PKGHOME symlink (same as
+# install_callback; idempotent).
+if [ -n "${TRIM_PKGHOME:-}" ] && [ -d "${TRIM_PKGHOME}" ]; then
+  ln -sfn "${TRIM_PKGHOME}" "/home/${TRIM_APPNAME:-dsh}" 2>/dev/null || true
+fi
+
 exit 0

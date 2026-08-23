@@ -1,3 +1,16 @@
 #!/bin/bash
-# Lifecycle hook; no action needed beyond the defaults (cmd/main owns runtime).
+# Drop the /home/<name> -> TRIM_PKGHOME symlink the install/upgrade
+# callbacks maintain — but only while it still points at THIS app's home.
+# The physical home stays on the volume: like @appdata, fnOS preserves
+# per-app data directories across uninstall, and the user's git credentials
+# and SSH keys in there must survive a reinstall.
+HOME_LINK="/home/${TRIM_APPNAME:-dsh}"
+if [ -L "$HOME_LINK" ]; then
+  target="$(readlink "$HOME_LINK" 2>/dev/null)"
+  if [ "$target" = "${TRIM_PKGHOME:-__none__}" ] || \
+     [ "$target" = "/var/apps/${TRIM_APPNAME:-dsh}/home" ]; then
+    rm -f "$HOME_LINK"
+  fi
+fi
+
 exit 0

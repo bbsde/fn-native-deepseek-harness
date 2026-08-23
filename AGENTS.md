@@ -4,7 +4,7 @@
 上游：https://github.com/deepseek-ai/deepseek-harness （MIT，npm 包 `@deepseek-ai/dsh`）。
 
 命名约定：**应用标识一律用 `dsh`**（appname、网关前缀 `/app/dsh`、运行用户 `dsh`、共享目录
-`dsh`（即应用主目录，rc.2.11 起不再下分 `workspace/`/`home/` 子目录）、显示名 `DS·H`）；
+`dsh`（= DSH_HOME）、系统级 home `/home/dsh`（软链到 `TRIM_PKGHOME`）、显示名 `DS·H`）；
 只有仓库名保留全称 fn-native-deepseek-harness。
 
 ## 架构（为什么长这样）
@@ -29,16 +29,23 @@
         → dsh web（127.0.0.1:3080，永远只绑回环）
 ```
 
-数据布局（**用户数据全在共享目录，@appdata 只放可再生文件**——卸载/升级失败/重装失败
-都不会丢配置、插件和会话）：
+数据布局（**三分：@appdata 可重置 / 共享目录是 DSH_HOME / @apphome 是系统级 home**——
+卸载/升级失败/重装失败都不会丢配置、插件、会话和 git 凭据）：
 
-- 共享根 `dsh` **本身就是 DSH_HOME + unix HOME + 默认会话 cwd**（data-share 声明，实际在
-  `/vol1/@appshare/dsh`，Windows ACL 权限模型：平台以**命名 ACL 条目**授权 dsh 用户，属主类
-  留空）——像一个真实的用户主目录：`.credentials.yaml`、settings.yaml、profiles/（插件代码）、
-  会话、market-present stamp、`.gitconfig`/`.git-credentials` 等点文件与 agent 的工作产出
-  同层共存，文件管理器全部可见。管理员覆盖文件 `github-accel`、`npm-registry`、
-  `market-registry` 也在根上，**文件管理器可直接编辑**（cmd/main 读共享优先、@appdata 旧位置
-  兜底）。cmd/main 启动 dsh 前 `cd` 进共享根，新会话 cwd 默认取 `process.getcwd()`。
+- 共享根 `dsh`（data-share 声明，实际在 `/vol1/@appshare/dsh`，Windows ACL 权限模型：
+  平台以**命名 ACL 条目**授权 dsh 用户，属主类留空）= **DSH_HOME**：`.credentials.yaml`、
+  settings.yaml、profiles/（插件代码）、会话、market-present stamp，加上 agent 的工作产出
+  （cmd/main 启动 dsh 前 `cd` 进共享根，新会话 cwd 默认取 `process.getcwd()`），文件管理器
+  全部可见。管理员覆盖文件 `github-accel`、`npm-registry`、`market-registry` 也在根上，
+  **文件管理器可直接编辑**（cmd/main 读共享优先、@appdata 旧位置兜底）。
+- **系统级 home = `/home/dsh` 软链 → `TRIM_PKGHOME`（`/vol1/@apphome/dsh`，装机时平台创建、
+  属主 dsh:dsh）**：dsh 这个**系统用户**的 unix home，跨会话全局状态——`~/.gitconfig`、
+  `~/.git-credentials`、`~/.ssh`、`~/.bash_history`——都落这里一次、所有会话共享。passwd 里
+  dsh 账户的 home 字段本就指向 `/home/dsh` 但平台不创建它（fnOS 自家应用如 hermes 也是自己
+  维护软链），install/upgrade_callback 负责 `ln -sfn`，uninstall_callback 只删仍指向本应用
+  home 的软链（物理目录保留，git 凭据/ssh key 活过卸载重装）。cmd/main 的 HOME 解析链：
+  `/home/dsh` 存在用之，缺失回退 `SYS_HOME_DIR` 并记日志（重装可恢复软链）。不设 HOME 时
+  目录选择器（`os.homedir()`）会落到不存在的路径报 ENOENT——这就是必须显式导出 HOME 的原因。
 - `TRIM_PKGVAR`（/vol1/@appdata/dsh）只放可再生状态：`runtime/`（install_callback 从 fpk
   解压）、`bin/` shims（seed-market 每次启动重生成）、`lastgood-web` 快照（回滚机械，
   非用户数据）、`market-cache/`、`.npm-cache`、`.xdg`、pid/log/flag。
@@ -58,22 +65,25 @@
 - **迁移**：老安装 `$TRIM_PKGVAR/dsh`（旧 home）由 cmd/main start 的 `migrate_home_to_share`
   一次性搬到共享根（tar 保 mode、排除缓存、覆盖文件 copy 过去、搬完删旧目录）；失败保留旧目录
   下次重试。rc.2.11 曾短暂用过的 `home/`+`workspace/`双子目录布局由 `flatten_share_layout`
-  逐项 mv 上提到根（撞名不覆盖、留在原处并记日志，子目录空了才删），全新安装两者皆无、
-  直接 no-op。share 型软链 `profiles/node_modules/dshmarket` 清理逻辑不变。
+  逐项 mv 上提到根（撞名不覆盖、留在原处并记日志，子目录空了才删）；rc.2.11 还短暂把共享根当
+  unix HOME 用，`migrate_home_state` 把点文件（`.gitconfig`/`.git-credentials`/`.ssh`/
+  `.bash_history`/`.local` 等**白名单**，`.credentials.yaml` 属 harness 数据不搬）一次性 mv 到
+  系统级 home，撞名保留共享侧副本。全新安装三条皆 no-op。share 型软链
+  `profiles/node_modules/dshmarket` 清理逻辑不变。
 - dsh 运行时整树以单文件 `src/app/runtime.tar.gz` 进 fpk（33k 文件打成 1 个，安装秒级），
   `cmd/install_callback`/`upgrade_callback` 在安装/升级时解压到 `$TRIM_PKGVAR/runtime`，
   cmd/main 从那里启动 dsh（解压失败的报错会指向重装）。
-- dsh 进程的 `HOME` 指向共享根（真正的 unix home，跨会话全局状态——`~/.gitconfig`、
-  `~/.git-credentials`、`~/.bash_history`、`~/.ssh`——都落这里一次、所有会话共享，文件管理器
-  可见；目录选择器默认列 `os.homedir()`，不设 HOME 会落到不存在的 `/home/dsh` 报 ENOENT）。
-  新会话默认 cwd 与 HOME 同为共享根。npm/XDG 缓存重定向到 `$TRIM_PKGVAR` 下（缓存可再生，
-  不占共享区）。**`SHELL` 也必须导出**：fnOS 应用账号的 passwd shell 是 `/usr/sbin/nologin`，
-  终端型插件（dsh-better-sidebar 的解析顺序是显式配置 → `$SHELL` → passwd）会 spawn
-  nologin——"This account is currently not available."，exit 1。
+- dsh 进程的 `HOME=/home/dsh`（系统级 home，见上）；新会话默认 cwd 是共享根。npm/XDG 缓存
+  重定向到 `$TRIM_PKGVAR` 下（缓存可再生，不占共享区和 home）。**`SHELL` 也必须导出**：
+  fnOS 应用账号的 passwd shell 是 `/usr/sbin/nologin`，终端型插件（dsh-better-sidebar 的
+  解析顺序是显式配置 → `$SHELL` → passwd）会 spawn nologin——"This account is currently
+  not available."，exit 1。
 
 关键 TRIM_ 环境变量（实测值）：`TRIM_APPDEST=/vol1/@appcenter/dsh`、
-`TRIM_PKGVAR=/vol1/@appdata/dsh`、`TRIM_DATA_SHARE_PATHS=/vol1/@appshare/dsh`。
-`/var/apps/dsh/shares/` 下是共享目录的软链（注意是 `shares` 不是 `share`）。
+`TRIM_PKGVAR=/vol1/@appdata/dsh`、`TRIM_PKGHOME=/vol1/@apphome/dsh`（应用账号 home，平台
+装机时创建）、`TRIM_DATA_SHARE_PATHS=/vol1/@appshare/dsh`。
+`/var/apps/dsh/shares/` 下是共享目录的软链（注意是 `shares` 不是 `share`）；
+`/var/apps/dsh/home` 同理软链到 `@apphome/dsh`。
 
 ## 目录
 

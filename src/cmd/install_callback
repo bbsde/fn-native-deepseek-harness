@@ -21,4 +21,13 @@ tar xzf "$RUNTIME_TAR" -C "$RUNTIME_DIR"
 # dir abort the appcenter chown walk during upgrades.
 find "$TRIM_PKGVAR" -xtype l -delete 2>/dev/null || true
 
+# System-level home for the dsh account: /home/dsh -> TRIM_PKGHOME. The
+# passwd entry for app accounts points at /home/<name> but nothing creates
+# it (fnOS's own apps maintain theirs the same way — see hermes); without it
+# every process that resolves the account home lands on a missing path.
+# Idempotent; never clobbers a real directory at /home/<name>.
+if [ -n "${TRIM_PKGHOME:-}" ] && [ -d "${TRIM_PKGHOME}" ]; then
+  ln -sfn "${TRIM_PKGHOME}" "/home/${TRIM_APPNAME:-dsh}" 2>/dev/null || true
+fi
+
 exit 0

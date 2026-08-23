@@ -1,7 +1,7 @@
 appname=dsh
-version=0.1.1-rc.2.11
+version=0.1.1-rc.2.12
 display_name=DS·H
-desc=DeepSeek Harness (DS·H) AI Agent 框架。通过统一网关在飞牛桌面内使用，仅管理员可访问；应用主目录（含 Agent 工作区、会话与全局配置）位于共享目录 dsh。
+desc=DeepSeek Harness (DS·H) AI Agent 框架。通过统一网关在飞牛桌面内使用，仅管理员可访问；harness 数据与 Agent 工作区位于共享目录 dsh，系统级主目录为 /home/dsh。
 source=thirdparty
 platform=x86
 
