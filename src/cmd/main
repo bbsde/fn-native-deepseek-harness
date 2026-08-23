@@ -60,16 +60,17 @@ export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
 # sessions) lives on the shared dsh directory so it survives any @appdata
 # wipe — failed upgrades, uninstall+reinstall, future fnOS semantics. The
 # @appdata tree keeps only regenerable state: the runtime tarball extraction,
-# caches, pids, logs, rollback snapshots. One declared share is the root;
-# workspace/ is the agent cwd (new sessions inherit it, output lands in the
-# file manager), home/ is DSH_HOME.
+# caches, pids, logs, rollback snapshots. The share root IS the dsh home —
+# DSH_HOME, unix HOME and the default session cwd in one place, like a real
+# user home: dotfiles and global state live alongside the agent's work files.
+# (Earlier layouts split home/ and workspace/ subdirectories out of the root;
+# start_app flattens those once.)
 SHARE_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
 if [ -z "$SHARE_ROOT" ]; then
   SHARE_ROOT="/var/apps/${APPNAME}/shares"
 fi
 SHARE_ROOT="${SHARE_ROOT%/}"
-WORKSPACE_DIR="${SHARE_ROOT}/workspace"
-DSH_HOME_DIR="${SHARE_ROOT}/home"
+DSH_HOME_DIR="${SHARE_ROOT}"
 
 log_msg() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
@@ -196,22 +197,25 @@ github_accel_root() {
 }
 
 # The full dsh launch environment, sourced inside a subshell before exec'ing
-# anything dsh-related: workspace cwd, HOME, caches, PATH shims, mirrors and
+# anything dsh-related: home-share cwd, HOME, caches, PATH shims, mirrors and
 # the GitHub accelerator. Both the web server and the online market install
 # run under it, so a supervised restart and a first-boot install behave
 # identically to a cold start.
 dsh_launch_env() {
-  cd "$WORKSPACE_DIR" || return 1
+  cd "$DSH_HOME_DIR" || return 1
   # The share grants dsh access through ACL entries, not owner bits, so a
   # credentials file freshly written there can carry group bits in its mode
   # and upstream would refuse to boot. Normalize on every launch.
   guard_credentials_mode
-  # The directory picker defaults to os.homedir(); without HOME the dsh
-  # user's passwd entry (/home/dsh) does not exist on fnOS. Pointing HOME
-  # at the shared workspace also makes "~" land in the user-visible share.
-  # npm/XDG caches are volatile by nature: they stay in @appdata so the
-  # share only ever holds user-meaningful state.
-  export HOME="$WORKSPACE_DIR"
+  # HOME is the dsh home share: the unix-home for every process in the tree.
+  # Cross-session global state — git credentials (~/.git-credentials via the
+  # seeded credential.helper), agent-written global git config (~/.gitconfig),
+  # shell history, SSH keys — persists there once for ALL sessions, visible
+  # in the file manager. (Without a real home every session had to keep its
+  # own copy of such facts.) New sessions take this same share as their
+  # default cwd (process cwd above); npm/XDG caches stay redirected to
+  # @appdata below.
+  export HOME="$DSH_HOME_DIR"
   # fnOS app accounts carry /usr/sbin/nologin as their passwd shell; plugins
   # that spawn a terminal (dsh-better-sidebar resolves $SHELL first, then the
   # passwd entry) would exec nologin — "This account is currently not
@@ -260,20 +264,49 @@ dsh_launch_env() {
   #   : | sudo tee $TRIM_PKGVAR/github-accel      (empty or "off" = off)
   local github_accel
   github_accel="$(github_accel_root)"
-  # fnOS grants the app user access to repo trees through ACL entries while
-  # the files stay owned by the human account; git's safe.directory ownership
-  # check then refuses every such repo ("detected dubious ownership") — the
-  # agent's own git calls and the sidebar's git tab both surface it as "not a
-  # git repository". The dsh account is an unprivileged service user whose
-  # whole job is working on admin-granted trees, so allow all (verified on
-  # fnOS git 2.39: safe.directory is honored through GIT_CONFIG_* env).
-  export GIT_CONFIG_KEY_0="safe.directory"
-  export GIT_CONFIG_VALUE_0="*"
-  local git_config_count=1
+  # git configuration for the MANAGED layer (safe.directory, acceleration,
+  # push shield) rides in a GIT_CONFIG_SYSTEM FILE, never GIT_CONFIG_* env
+  # pairs: upstream's subprocess layer scrubs every env name matching
+  # /KEY|PASSWORD|SECRET|TOKEN/i from child processes (dsh-subprocess's
+  # SENSITIVE_ENV_PATTERN — agent bash sessions and node-pty spawners alike),
+  # so GIT_CONFIG_KEY_n would be stripped while GIT_CONFIG_COUNT survives,
+  # and every config-reading git command then dies with "missing config key".
+  # The *_SYSTEM/*_GLOBAL names carry no sensitive substring and pass the
+  # scrub. Contents, rebuilt each launch (github-accel edits apply on
+  # restart):
+  #   safe.directory=* — fnOS grants repo trees via ACL while the files stay
+  #     owned by the human account; without it every repo reads as
+  #     "detected dubious ownership" ("not a git repository" to the agent
+  #     and the sidebar git tab).
+  #   url.<accel> insteadOf — fetch/clone acceleration for github.com.
+  #   url.github pushInsteadOf — identity shield: git prefers pushInsteadOf
+  #     for push URLs, so pushes stay DIRECT on github.com (gh-proxy-style
+  #     caches are read-only; a push through one fails at best and leaks
+  #     credentials to a third party at worst).
+  local gitconfig="${TRIM_PKGVAR}/gitconfig"
+  {
+    printf '[safe]\n\tdirectory = *\n'
+    if [ -n "$github_accel" ]; then
+      printf '[url "%s"]\n\tinsteadOf = https://github.com/\n' "${github_accel}https://github.com/"
+      printf '[url "https://github.com/"]\n\tpushInsteadOf = https://github.com/\n'
+    fi
+  } > "$gitconfig" 2>>"$LOG_FILE" || true
+  chmod 644 "$gitconfig" 2>/dev/null || true
+  # SYSTEM layer, not GLOBAL: system scope is still an officially honored
+  # home for safe.directory, and the user/agent "git config --global" layer
+  # keeps writing the persistent ~/.gitconfig in the home share — our
+  # regenerated file never clobbers it.
+  export GIT_CONFIG_SYSTEM="$gitconfig"
+  # Seed the user layer once: stored credentials are the only credential
+  # mechanism that works headless (no terminal prompts in tool sessions).
+  # One line in ~/.git-credentials
+  # (https://<user>:<token>@github.com) then authenticates every session.
+  if [ ! -f "${HOME}/.gitconfig" ]; then
+    printf '[credential]\n\thelper = store\n' > "${HOME}/.gitconfig" 2>>"$LOG_FILE" || true
+    chmod 600 "${HOME}/.gitconfig" 2>/dev/null || true
+    log_msg "seeded ~/.gitconfig with credential.helper=store (add https://<user>:<token>@github.com lines to ~/.git-credentials to authenticate git push)"
+  fi
   if [ -n "$github_accel" ]; then
-    export GIT_CONFIG_KEY_1="url.${github_accel}https://github.com/.insteadOf"
-    export GIT_CONFIG_VALUE_1="https://github.com/"
-    git_config_count=2
     # pnpm's GitHub tarball downloads (https://codeload.github.com/…) are
     # plain HTTPS, not git CLI — insteadOf cannot see them. The preload
     # rewrites those at the https.request/fetch layer; it must ride along
@@ -282,13 +315,12 @@ dsh_launch_env() {
     export DSH_GH_ACCEL="$github_accel"
     export NODE_OPTIONS="--require ${TRIM_APPDEST}/bin/gh-accel-preload.cjs${NODE_OPTIONS:+ ${NODE_OPTIONS}}"
   fi
-  export GIT_CONFIG_COUNT="$git_config_count"
   mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$npm_config_cache" 2>/dev/null || true
   return 0
 }
 
 launch_dsh_web() {
-  log_msg "Starting dsh web on 127.0.0.1:$DSH_PORT (cwd $WORKSPACE_DIR)"
+  log_msg "Starting dsh web on 127.0.0.1:$DSH_PORT (cwd $DSH_HOME_DIR)"
   (
     dsh_launch_env || exit 1
     # Market catalog fetch through the local stale-while-revalidate cache,
@@ -611,7 +643,7 @@ parent_alive() {
 }
 
 # Tracked replacement of dsh web: stop everything serving the port, boot a
-# fresh instance with the full launch environment (workspace cwd, mirrors,
+# fresh instance with the full launch environment (home-share cwd, mirrors,
 # accelerators, catalog-cache routing — none of which dshmarket's own
 # self-restart replay provides), run the boot watchdog, snapshot the profile.
 # The supervisor calls this when the relay flags the market's restart button
@@ -662,7 +694,7 @@ start_supervisor() {
 }
 
 # One-time move of the pre-share home (credentials, settings, profiles,
-# sessions) from @appdata onto the dsh/home share. Runs at start — after the
+# sessions) from @appdata onto the share root. Runs at start — after the
 # platform has created the share (its existence at upgrade_callback time is
 # not guaranteed), before anything reads the home. Caches are left behind to
 # die with the old directory. A failed migration logs loudly and lets the
@@ -696,16 +728,42 @@ migrate_home_to_share() {
   find "$TRIM_PKGVAR" -xtype l -delete 2>/dev/null || true
 }
 
+# Earlier layouts kept the dsh home in <share>/home and the agent cwd in
+# <share>/workspace; the share root itself is home now. One-time flatten of
+# both subdirectories' contents into the root (a plain mv per top-level item
+# — dotfiles included). Collisions are never overwritten: the item stays in
+# its subdirectory, logged, for manual sorting; the subdirectory itself only
+# disappears once empty. Fresh installs see neither dir and no-op.
+flatten_share_layout() {
+  local sub item name moved
+  for sub in home workspace; do
+    [ -d "${SHARE_ROOT}/${sub}" ] || continue
+    moved=0
+    while IFS= read -r -d '' item; do
+      name="${item##*/}"
+      if [ -e "${SHARE_ROOT}/${name}" ] || [ -L "${SHARE_ROOT}/${name}" ]; then
+        log_msg "share flatten: ${sub}/${name} collides with ${name} at the share root; leaving it for manual sorting"
+        continue
+      fi
+      mv "$item" "${SHARE_ROOT}/${name}" 2>>"$LOG_FILE" || continue
+      moved=$((moved + 1))
+    done < <(find "${SHARE_ROOT}/${sub}" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    if rmdir "${SHARE_ROOT}/${sub}" 2>/dev/null; then
+      log_msg "share flatten: moved $moved item(s) from ${sub}/ into the share root"
+    else
+      log_msg "share flatten: ${sub}/ kept (not empty after merge — see collisions above)"
+    fi
+  done
+}
+
 start_app() {
   if status_app; then
     return 0
   fi
 
   mkdir -p "$DSH_HOME_DIR" 2>>"$LOG_FILE" || true
+  flatten_share_layout
   migrate_home_to_share
-  if [ ! -d "$WORKSPACE_DIR" ]; then
-    mkdir -p "$WORKSPACE_DIR" 2>/dev/null || true
-  fi
   if [ ! -f "$DSH_BIN" ]; then
     log_msg "dsh entry missing: $DSH_BIN"
     echo "dsh runtime not extracted; reinstall the app (see $LOG_FILE)" > "$TRIM_TEMP_LOGFILE"

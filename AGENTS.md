@@ -3,8 +3,9 @@
 把 DeepSeek Harness（dsh，AI Agent 框架）打包成飞牛 fnOS 原生应用（.fpk）的工程。
 上游：https://github.com/deepseek-ai/deepseek-harness （MIT，npm 包 `@deepseek-ai/dsh`）。
 
-命名约定：**应用标识一律用 `dsh`**（appname、网关前缀 `/app/dsh`、运行用户 `dsh`、共享根
-`dsh`（下分 `workspace/` 与 `home/`）、显示名 `DS·H`）；只有仓库名保留全称 fn-native-deepseek-harness。
+命名约定：**应用标识一律用 `dsh`**（appname、网关前缀 `/app/dsh`、运行用户 `dsh`、共享目录
+`dsh`（即应用主目录，rc.2.11 起不再下分 `workspace/`/`home/` 子目录）、显示名 `DS·H`）；
+只有仓库名保留全称 fn-native-deepseek-harness。
 
 ## 架构（为什么长这样）
 
@@ -31,14 +32,13 @@
 数据布局（**用户数据全在共享目录，@appdata 只放可再生文件**——卸载/升级失败/重装失败
 都不会丢配置、插件和会话）：
 
-- 共享根 `dsh`（data-share 声明，实际在 `/vol1/@appshare/dsh`，Windows ACL 权限模型：
-  平台以**命名 ACL 条目**授权 dsh 用户，属主类留空）：
-  - `dsh/home/` = DSH_HOME：`.credentials.yaml`、settings.yaml、profiles/（插件代码）、
-    会话、market-present stamp。管理员覆盖文件 `github-accel`、`npm-registry`、
-    `market-registry` 也在这里，**文件管理器可直接编辑**（cmd/main 读共享优先、
-    @appdata 旧位置兜底）。
-  - `dsh/workspace/`：agent 工作目录。cmd/main 启动 dsh 前 `cd` 进去，新会话 cwd 默认取
-    `process.getcwd()`，产出文件天然落在共享区，文件管理器可见。
+- 共享根 `dsh` **本身就是 DSH_HOME + unix HOME + 默认会话 cwd**（data-share 声明，实际在
+  `/vol1/@appshare/dsh`，Windows ACL 权限模型：平台以**命名 ACL 条目**授权 dsh 用户，属主类
+  留空）——像一个真实的用户主目录：`.credentials.yaml`、settings.yaml、profiles/（插件代码）、
+  会话、market-present stamp、`.gitconfig`/`.git-credentials` 等点文件与 agent 的工作产出
+  同层共存，文件管理器全部可见。管理员覆盖文件 `github-accel`、`npm-registry`、
+  `market-registry` 也在根上，**文件管理器可直接编辑**（cmd/main 读共享优先、@appdata 旧位置
+  兜底）。cmd/main 启动 dsh 前 `cd` 进共享根，新会话 cwd 默认取 `process.getcwd()`。
 - `TRIM_PKGVAR`（/vol1/@appdata/dsh）只放可再生状态：`runtime/`（install_callback 从 fpk
   解压）、`bin/` shims（seed-market 每次启动重生成）、`lastgood-web` 快照（回滚机械，
   非用户数据）、`market-cache/`、`.npm-cache`、`.xdg`、pid/log/flag。
@@ -56,16 +56,20 @@
   （保留 vNN 版本后缀）；store 是内容寻址缓存，新位置缺什么 pnpm 自己重拉。**XDG_DATA_HOME
   的根若变更，该函数里的 store_root 字面量必须同步**。
 - **迁移**：老安装 `$TRIM_PKGVAR/dsh`（旧 home）由 cmd/main start 的 `migrate_home_to_share`
-  一次性搬到共享 `home/`（tar 保 mode、排除缓存、覆盖文件 copy 过去、搬完删旧目录）；
-  失败保留旧目录下次重试。share 型软链 `profiles/node_modules/dshmarket` 清理逻辑不变。
+  一次性搬到共享根（tar 保 mode、排除缓存、覆盖文件 copy 过去、搬完删旧目录）；失败保留旧目录
+  下次重试。rc.2.11 曾短暂用过的 `home/`+`workspace/`双子目录布局由 `flatten_share_layout`
+  逐项 mv 上提到根（撞名不覆盖、留在原处并记日志，子目录空了才删），全新安装两者皆无、
+  直接 no-op。share 型软链 `profiles/node_modules/dshmarket` 清理逻辑不变。
 - dsh 运行时整树以单文件 `src/app/runtime.tar.gz` 进 fpk（33k 文件打成 1 个，安装秒级），
   `cmd/install_callback`/`upgrade_callback` 在安装/升级时解压到 `$TRIM_PKGVAR/runtime`，
   cmd/main 从那里启动 dsh（解压失败的报错会指向重装）。
-- dsh 进程的 `HOME` 指向共享 workspace（目录选择器默认列 `os.homedir()`，不设 HOME 会
-  落到不存在的 `/home/dsh` 报 ENOENT）；npm/XDG 缓存重定向到 `$TRIM_PKGVAR` 下
-  （缓存可再生，不占共享区）。**`SHELL` 也必须导出**：fnOS 应用账号的 passwd shell 是
-  `/usr/sbin/nologin`，终端型插件（dsh-better-sidebar 的解析顺序是显式配置 → `$SHELL` →
-  passwd）会 spawn nologin——"This account is currently not available."，exit 1。
+- dsh 进程的 `HOME` 指向共享根（真正的 unix home，跨会话全局状态——`~/.gitconfig`、
+  `~/.git-credentials`、`~/.bash_history`、`~/.ssh`——都落这里一次、所有会话共享，文件管理器
+  可见；目录选择器默认列 `os.homedir()`，不设 HOME 会落到不存在的 `/home/dsh` 报 ENOENT）。
+  新会话默认 cwd 与 HOME 同为共享根。npm/XDG 缓存重定向到 `$TRIM_PKGVAR` 下（缓存可再生，
+  不占共享区）。**`SHELL` 也必须导出**：fnOS 应用账号的 passwd shell 是 `/usr/sbin/nologin`，
+  终端型插件（dsh-better-sidebar 的解析顺序是显式配置 → `$SHELL` → passwd）会 spawn
+  nologin——"This account is currently not available."，exit 1。
 
 关键 TRIM_ 环境变量（实测值）：`TRIM_APPDEST=/vol1/@appcenter/dsh`、
 `TRIM_PKGVAR=/vol1/@appdata/dsh`、`TRIM_DATA_SHARE_PATHS=/vol1/@appshare/dsh`。
@@ -103,10 +107,12 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
   （relay/脚本改动）重新发布时用 `DSH_WRAPPER_BUILD=1 ./build.sh`（版本变
   `0.1.0-rc.6.1`）。入口为浏览器新标签页打开（ui/config `type: "url"`），不是桌面 iframe。
   **`DSH_WRAPPER_BUILD` 的值就是修订号后缀**（`=11` → `0.1.0-rc.7.11`）。
-  **封装修订号不能跨 9→10 进位**：fnOS 部分安装路径（桌面 UI 的手动安装/升级）按字符串比较
-  版本，`0.1.0-rc.7.10/7.11` < `0.1.0-rc.7.9`（'1'<'9'）会被拒"不符合系统要求"，且拒绝
-  发生在客户端、journal 无任何 APP_ 事件；CLI install-fpk 不做此检查。修订号到 9 之后再
-  发版要跳到对字符串和数值比较都更大的段（如 `.90` 起），`.12`→`.13` 这类不跨 9 的递增安全。
+  **封装修订号按普通数值递增**（`.9` → `.10`、`.11`…；2026-08 起项目所有者决定）。
+  历史事故备查：fnOS 1.1.x 的桌面手动安装/升级曾按**字符串**比较版本，
+  `0.1.0-rc.7.10/7.11` < `0.1.0-rc.7.9`（'1'<'9'）被拒"不符合系统要求"，拒绝发生在
+  客户端、journal 无任何 APP_ 事件；CLI install-fpk 不做此检查。若新固件复现进位版本
+  被桌面拒装，再临时跳到对字符串和数值比较都更大的段（如 `.90` 起，`.90`~`.99` 安全，
+  `.99` 之后同理跳 `.900`）。
   输出 `dist/dsh_<版本>.fpk`（附 .info.txt），并把所用上游版本写回 `package.json` 的
   `dshVersion`（钉版是唯一上游版本来源，**精确钉死**，rc 阶段破坏性变更多）。
   同版本重复构建走快速路径（跳过远程安装与重写——rewrite-dist 带幂等预检）；换新版本自动
@@ -260,14 +266,14 @@ dshmarket 的取数指过去。面板请求**立即**返回磁盘缓存（`$TRIM
 目录（含非空 plugins 数组）才覆盖缓存，坏响应不会污染好副本。冷启动且源站拉不到时按
 dshmarket 的耐心上限回 503（面板显示可重试错误，与上游行为一致）。缓存服务死了自动退
 回上游直连（cmd/main 探 healthz，不通就不注入）。换源/关闭：`echo <URL或off> | sudo tee
-/vol1/@appshare/dsh/home/market-registry`（或文件管理器直接编辑共享里的同名文件）后重启
+/vol1/@appshare/dsh/market-registry`（或文件管理器直接编辑共享里的同名文件）后重启
 应用。契约测试 `scripts/test-catalog-cache.mjs`。
 
 - **插件安装走国内源**：cmd/main 给 dsh 进程（及其 pnpm 子进程）export
   `npm_config_registry=https://registry.npmmirror.com`（`NODEJS_ORG_MIRROR` 同步指向
   npmmirror 的 node 头文件，带原生依赖的插件编译不再等 nodejs.org）。镜像出问题时
   （如刚发布的包还没同步）：`echo https://registry.npmjs.org | sudo tee
-  /vol1/@appshare/dsh/home/npm-registry` 后重启应用即回官方源。
+  /vol1/@appshare/dsh/npm-registry` 后重启应用即回官方源。
 - **市场详情页的 GitHub 资源也走代理（relay 运行期重写）**：dshmarket 的 client 直接在
   浏览器里拉 `raw.githubusercontent.com` 的 README/截图和 `github.com/<owner>.png` 头像，
   CN 网络下 DNS 全挂（控制台一片 ERR_NAME_NOT_RESOLVED / ERR_CONNECTION_RESET）→
@@ -284,18 +290,27 @@ dshmarket 的耐心上限回 503（面板显示可重试错误，与上游行为
      Node 进程，在 https.request/fetch 层把 codeload 地址改写到代理（实测 pnpm 10 走
      node:https）。两层都只影响本应用进程树，不碰 NAS 全局配置；dsh agent 自己的
      clone/下载也会被加速。第三方代理有信任成本，换地址/禁用：
-     `echo https://ghproxy.net/ | sudo tee /vol1/@appshare/dsh/home/github-accel`（写代理根地址，
+     `echo https://ghproxy.net/ | sudo tee /vol1/@appshare/dsh/github-accel`（写代理根地址，
      带 https 和尾斜杠；也接受已含 github.com 的完整前缀；置空或写 off 即关）后重启应用。
   gh-proxy.org 是 gh-proxy.com 的 301 别名（同一服务），填哪个效果一样、.com 少一跳。
   `api.github.com` 的元数据请求（star 数等）不在改写范围。
-- **git safe.directory（必须有，不然一切用户仓库在 dsh 下都报 dubious ownership）**：
-  fnOS 经 ACL 把仓库树授权给应用用户，但文件属主仍是管理员账号——git 的属主安全检查
-  拒绝操作（`fatal: detected dubious ownership`），agent 自己的 git 调用和侧边栏插件的
-  git 页都会把它当成"不是 git 仓库"。cmd/main 经 `GIT_CONFIG_*` env 注入
-  `safe.directory = *`（dsh 是无特权服务账号，其职责就是操作管理员授予的树；实测
-  fnOS git 2.39 尊重 env 传入的 safe.directory）。**该 env 与 gh-accel 的 insteadOf
-  共用 GIT_CONFIG_COUNT 计数**（KEY_0=safe.directory，KEY_1=insteadOf，加速关闭时
-  COUNT=1）——再往这组 env 加条目时两处都要同步。
+- **git 配置分两层，托管层载体必须是 `GIT_CONFIG_SYSTEM` 文件，不能用 GIT_CONFIG_* env
+  对**：上游 `dsh-subprocess` 的凭证清洗 `SENSITIVE_ENV_PATTERN =
+  /KEY|PASSWORD|SECRET|TOKEN/i` 会把**名字含 KEY** 的变量从一切子进程剥掉（agent bash
+  会话、node-pty 终端都走这套）——`GIT_CONFIG_KEY_n` 被剥而 `GIT_CONFIG_COUNT` 幸存，
+  git 直接 `missing config key` 崩溃（exit 128）。`GIT_CONFIG_SYSTEM/GLOBAL` 名字不含
+  敏感词能穿过清洗。托管层（`$TRIM_PKGVAR/gitconfig`，每次启动重写，`GIT_CONFIG_SYSTEM`
+  指向）三条：`safe.directory = *`（fnOS 经 ACL 授权仓库树但文件属主仍是管理员，否则
+  每个仓库都 dubious ownership）；加速开启时 `url.<accel> insteadOf`（fetch/clone 走
+  代理）+ identity `pushInsteadOf`（**push 一律直连 github.com**——gh-proxy 类代理只读，
+  push 走它轻则失败重则把 GitHub 凭证泄给第三方；git 对 push 优先应用
+  pushInsteadOf，trace 实证）。**必须用 SYSTEM 而非 GLOBAL**：GLOBAL 指向托管文件会让
+  `git config --global` 的写入也进这个文件、每次重启被重写抹掉；SYSTEM 层级同样被
+  safe.directory 官方支持，用户/agent 的 `--global` 写入走正常 `~/.gitconfig`
+  （HOME=共享 home，持久）。cmd/main 首启预置 `credential.helper = store`（仅当
+  ~/.gitconfig 不存在）——工具会话无终端提示，store 是 headless 唯一可行的凭证机制；
+  `~/.git-credentials` 写一行 `https://<user>:<token>@github.com` 即全会话生效。
+  改 github-accel 重启即重写生效。
 
 - **市场升级**：面板内自更新即生效并持久（在线安装的副本不会被任何 seed 触碰）。
   relay 的 JS 规则若因新版 client.js 字符串形态变化而失配，症状是面板 RPC 打到网关
@@ -354,7 +369,8 @@ getfacl 可见、实际不生效，祖先层的列举权授不出来（fn-native
 ## 开发测试生命周期（平台：nas31）
 
 **出包后不主动 scp 到测试机**：fpk 留在 `dist/` 即可，用户自己通过 fnOS 桌面页面上传安装
-（页面路径有客户端版本检查，版本号必须对已装版本字符串递增——见构建节的"跨 9 陷阱"；
+（页面路径有客户端版本检查，版本号必须对已装版本递增——见构建节的"封装修订号递增"
+  历史备查（1.1.x 固件曾按字符串比较拒进位版本）；
 设备处于异常状态时页面会拒装，那时才需要在宿主 shell 走 CLI 卸载重装）。
 
 测试机已配好 SSH 免密别名：`~/.ssh/config` → `Host nas31`（192.168.0.31，用户 李承龙，
