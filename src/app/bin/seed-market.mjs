@@ -44,6 +44,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 
 const args = process.argv.slice(2)
 const readArg = (name) => {
@@ -127,6 +128,61 @@ if (fs.existsSync(manifestFile)) {
   log('seeded a bare web profile (market deferred to a later start)')
 } else {
   console.log('NEEDS_MARKET_INSTALL')
+}
+
+// --- 4.5 node-pty alignment (terminal plugins) ---------------------------------
+//
+// Terminal plugins (dsh-better-sidebar) depend on node-pty@^1.1.0, which
+// ships NO prebuilds: on stock fnOS (no g++/make) it can never compile, and
+// pnpm 10 blocks dependency build scripts anyway — the sidebar terminal dies
+// with "node-pty 加载失败" out of the box. The dsh runtime's own node-pty
+// carries full prebuilds (linux-x64/arm64 included) and loads without any
+// toolchain (verified: --ignore-scripts install + spawn OK). Pin the
+// profile's resolution to the runtime's version via a pnpm override — the
+// plugin's own repair flow states the same goal ("node-pty 与 DSH 核心保持
+// 同一版本"). The override is pre-seeded so the FIRST install of such a
+// plugin resolves the prebuilt version directly; a later `dsh plugin add`
+// that wipes it is re-healed on the next start.
+{
+  const runtimePtyPkg = path.join(nodeModules, 'node-pty', 'package.json')
+  if (fs.existsSync(runtimePtyPkg) && fs.existsSync(manifestFile)) {
+    const want = JSON.parse(fs.readFileSync(runtimePtyPkg, 'utf8')).version
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'))
+    const overrideNow = manifest.pnpm?.overrides?.['node-pty']
+    let have = null
+    try {
+      have = JSON.parse(fs.readFileSync(path.join(profileDir, 'node_modules', 'node-pty', 'package.json'), 'utf8')).version
+    } catch {}
+    if (overrideNow !== want) {
+      manifest.pnpm ??= {}
+      manifest.pnpm.overrides ??= {}
+      manifest.pnpm.overrides['node-pty'] = want
+      fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`)
+      log(`pinned profile node-pty to the runtime's ${want} (prebuilt, no toolchain needed)`)
+    }
+    if (have !== null && have !== want) {
+      log(`re-aligning installed node-pty ${have} -> ${want}`)
+      const pkgvar = path.dirname(bindir)
+      const result = spawnSync(path.join(bindir, 'pnpm'), ['install', '--prefer-offline'], {
+        cwd: profileDir,
+        timeout: 300_000,
+        env: {
+          ...process.env,
+          HOME: homeDir,
+          DSH_HOME: homeDir,
+          npm_config_registry: 'https://registry.npmmirror.com',
+          npm_config_cache: path.join(pkgvar, '.npm-cache'),
+          XDG_CACHE_HOME: path.join(pkgvar, '.xdg', 'cache'),
+          XDG_CONFIG_HOME: path.join(pkgvar, '.xdg', 'config'),
+          XDG_DATA_HOME: path.join(pkgvar, '.xdg', 'data'),
+          PATH: `${bindir}:/var/apps/nodejs_v24/target/bin:/usr/bin:/bin`,
+        },
+        stdio: ['ignore', 'inherit', 'inherit'],
+      })
+      if (result.status === 0) log(`profile node-pty aligned to ${want}`)
+      else log(`node-pty alignment install failed (status ${result.status ?? result.error}); retrying on the next start`)
+    }
+  }
 }
 
 // --- 5. recovery rotation ------------------------------------------------------

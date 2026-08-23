@@ -97,6 +97,14 @@ const JS_PATH_RULES = [
   ['"/dsh-market/', `"${PREFIX}/dsh-market/`],
   ["'/dsh-market/", `'${PREFIX}/dsh-market/`],
   ['`/dsh-market/', `\`${PREFIX}/dsh-market/`],
+  // dsh-better-sidebar's VSCode-style panel: /sidebar/api|upload|file|html|
+  // bundle routes plus its /sidebar/ws/* terminal upgrades. Belt-and-braces
+  // alongside BASE_PATH_SHIM below — the shim already covers these at the
+  // request layer, the string rule keeps the literal forms prefixed even in
+  // non-request contexts.
+  ['"/sidebar/', `"${PREFIX}/sidebar/`],
+  ["'/sidebar/", `'${PREFIX}/sidebar/`],
+  ['`/sidebar/', `\`${PREFIX}/sidebar/`],
 ]
 // dshmarket's detail view pulls READMEs/screenshots from
 // raw.githubusercontent.com and author avatars from github.com DIRECTLY in
@@ -120,6 +128,86 @@ function rewritePluginJs(body) {
   for (const [from, to] of JS_CDN_RULES) out = out.replaceAll(from, to)
   return out
 }
+
+// Base-path shim: dsh and every runtime-installed plugin client assume the
+// app sits at the site root, so their root-absolute URLs ("/api/…",
+// "/sidebar/…", whatever the next plugin invents) miss the gateway prefix —
+// and the NAS gateway only routes /app/<name> to this socket, so those
+// requests 404 before any server-side catch-all could help. Source-text
+// rewriting (JS_PATH_RULES above) cannot keep up with arbitrary string
+// construction, so this shim patches the request-layer APIs themselves,
+// injected into <head> ahead of every module bundle: same-origin
+// root-absolute URLs gain the prefix at call time. Cross-origin URLs,
+// protocol-relative "//…", already-prefixed and relative paths pass through
+// untouched. Known gaps (acceptable): bare dynamic import() does not go
+// through window.fetch (lazy chunks loaded via <script src> ARE covered by
+// the src setter), and a Request INSTANCE carrying a body loses it on
+// rewrite (string inputs — what every observed caller uses — are exact).
+// Markers delimit the body for the contract test
+// (scripts/test-base-path-shim.mjs); <PREFIX> is substituted at load.
+const BASE_PATH_SHIM_BODY = `/*__DSH_BASE_SHIM_START__*/(function(P){
+"use strict";
+if(window.__DSH_BASE_SHIM__)return;window.__DSH_BASE_SHIM__=true;
+function fix(u){
+	if(typeof u!=="string"||u===""||u.charAt(0)!=="/")return u;
+	if(u.charAt(1)==="/")return u;
+	if(u===P||u.indexOf(P+"/")===0)return u;
+	return P+u;
+}
+function fixAbs(u){
+	u=fix(u);
+	if(typeof u!=="string")return u;
+	if(!/^(?:https?|wss?):/i.test(u))return u;
+	try{
+		var p=new URL(u);
+		var base=p.protocol==="ws:"?"http:":p.protocol==="wss:"?"https:":p.protocol;
+		if(base+"//"+p.host!==location.origin)return u;
+		if(p.pathname===P||p.pathname.indexOf(P+"/")===0)return u;
+		p.pathname=P+p.pathname;
+		return p.href;
+	}catch(e){return u;}
+}
+var F=window.fetch;
+if(F)window.fetch=function(input,init){
+	try{
+		if(typeof input==="string")return F.call(this,fixAbs(input),init);
+		if(input&&typeof input.url==="string"){
+			var fixed=fixAbs(input.url);
+			if(fixed!==input.url)return F.call(this,new Request(fixed,input),init);
+		}
+	}catch(e){}
+	return F.apply(this,arguments);
+};
+var O=XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open=function(){
+	var a=Array.prototype.slice.call(arguments);
+	if(a.length>1)a[1]=fixAbs(a[1]);
+	return O.apply(this,a);
+};
+function wrapCtor(Orig){
+	if(!Orig)return null;
+	var Shim=function(a,b){return new Orig(fixAbs(a),b);};
+	Shim.prototype=Orig.prototype;
+	Object.getOwnPropertyNames(Orig).forEach(function(k){
+		if(!(k in Shim)){try{Shim[k]=Orig[k]}catch(e){}}
+	});
+	return Shim;
+}
+var WS=window.WebSocket;if(WS)window.WebSocket=wrapCtor(WS);
+var ES=window.EventSource;if(ES)window.EventSource=wrapCtor(ES);
+var SB=navigator.sendBeacon;
+if(SB)navigator.sendBeacon=function(url,data){return SB.call(navigator,fixAbs(url),data);};
+var D=Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype,"src");
+if(D&&D.set)Object.defineProperty(HTMLScriptElement.prototype,"src",{
+	get:D.get,configurable:true,
+	set:function(v){D.set.call(this,fix(String(v)))}
+});
+var PS=history.pushState,RS=history.replaceState;
+history.pushState=function(s,t,u){return PS.call(this,s,t,u==null?u:fixAbs(String(u)))};
+history.replaceState=function(s,t,u){return RS.call(this,s,t,u==null?u:fixAbs(String(u)))};
+})(/*__DSH_BASE_SHIM_END__*/<PREFIX>)`
+
+const BASE_PATH_SHIM = `<script>${BASE_PATH_SHIM_BODY.replace('<PREFIX>', JSON.stringify(PREFIX))}</script>`
 
 // The fnOS desktop serves this page over plain HTTP on a LAN address, which is
 // not a secure context: crypto.randomUUID is undefined there and the dsh
@@ -167,9 +255,10 @@ function forwardHeaders(headers) {
 function rewriteHtml(body) {
   let out = body
   for (const [from, to] of HTML_RULES) out = out.replaceAll(from, to)
+  const injections = BASE_PATH_SHIM + SECURE_CONTEXT_POLYFILL
   const anchor = out.indexOf('<head>')
-  if (anchor !== -1) return out.slice(0, anchor + 6) + SECURE_CONTEXT_POLYFILL + out.slice(anchor + 6)
-  return SECURE_CONTEXT_POLYFILL + out
+  if (anchor !== -1) return out.slice(0, anchor + 6) + injections + out.slice(anchor + 6)
+  return injections + out
 }
 
 function deny(res, code, message) {

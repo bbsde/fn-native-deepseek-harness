@@ -20,7 +20,11 @@
             - Host/Origin/Referer 重写为 127.0.0.1:3080（通过 dsh 的 browser-trust fence）
             - 删 accept-encoding 后对 HTML 做运行期重写（__DSH_BOOT__ 注入的 /plugins/ URL 前缀化）
             - 注入 crypto.randomUUID polyfill（fnOS 桌面经 HTTP+局域网 IP 访问是非安全上下文，
-              该 API 不存在，dsh 前端拿它生成 RPC 关联 ID——工作区选择器会因此报错）            - 代理 WebSocket 升级（/api/events.mux、/api/events.host）
+              该 API 不存在，dsh 前端拿它生成 RPC 关联 ID——工作区选择器会因此报错）
+            - 注入 base-path 垫片（BASE_PATH_SHIM）：包装 fetch/XHR/WebSocket/EventSource/
+              sendBeacon/script.src/pushState，同源根绝对 URL 在调用层补网关前缀——
+              插件自带任意根路由（如 dsh-better-sidebar 的 /sidebar/*）无需逐个出规则
+            - 代理 WebSocket 升级（通用：剥前缀后转发任意升级路径，不限于 events.*）
         → dsh web（127.0.0.1:3080，永远只绑回环）
 ```
 
@@ -59,7 +63,9 @@
   cmd/main 从那里启动 dsh（解压失败的报错会指向重装）。
 - dsh 进程的 `HOME` 指向共享 workspace（目录选择器默认列 `os.homedir()`，不设 HOME 会
   落到不存在的 `/home/dsh` 报 ENOENT）；npm/XDG 缓存重定向到 `$TRIM_PKGVAR` 下
-  （缓存可再生，不占共享区）。
+  （缓存可再生，不占共享区）。**`SHELL` 也必须导出**：fnOS 应用账号的 passwd shell 是
+  `/usr/sbin/nologin`，终端型插件（dsh-better-sidebar 的解析顺序是显式配置 → `$SHELL` →
+  passwd）会 spawn nologin——"This account is currently not available."，exit 1。
 
 关键 TRIM_ 环境变量（实测值）：`TRIM_APPDEST=/vol1/@appcenter/dsh`、
 `TRIM_PKGVAR=/vol1/@appdata/dsh`、`TRIM_DATA_SHARE_PATHS=/vol1/@appshare/dsh`。
@@ -282,16 +288,40 @@ dshmarket 的耐心上限回 503（面板显示可重试错误，与上游行为
      带 https 和尾斜杠；也接受已含 github.com 的完整前缀；置空或写 off 即关）后重启应用。
   gh-proxy.org 是 gh-proxy.com 的 301 别名（同一服务），填哪个效果一样、.com 少一跳。
   `api.github.com` 的元数据请求（star 数等）不在改写范围。
+- **git safe.directory（必须有，不然一切用户仓库在 dsh 下都报 dubious ownership）**：
+  fnOS 经 ACL 把仓库树授权给应用用户，但文件属主仍是管理员账号——git 的属主安全检查
+  拒绝操作（`fatal: detected dubious ownership`），agent 自己的 git 调用和侧边栏插件的
+  git 页都会把它当成"不是 git 仓库"。cmd/main 经 `GIT_CONFIG_*` env 注入
+  `safe.directory = *`（dsh 是无特权服务账号，其职责就是操作管理员授予的树；实测
+  fnOS git 2.39 尊重 env 传入的 safe.directory）。**该 env 与 gh-accel 的 insteadOf
+  共用 GIT_CONFIG_COUNT 计数**（KEY_0=safe.directory，KEY_1=insteadOf，加速关闭时
+  COUNT=1）——再往这组 env 加条目时两处都要同步。
 
 - **市场升级**：面板内自更新即生效并持久（在线安装的副本不会被任何 seed 触碰）。
   relay 的 JS 规则若因新版 client.js 字符串形态变化而失配，症状是面板 RPC 打到网关
   404——按新版实际字符串更新 relay.mjs 的 JS_PATH_RULES/JS_CDN_RULES 并重新验证。
+- **node-pty 对齐（终端类插件的硬前提，seed-market 第 4.5 步）**：dsh-better-sidebar
+  依赖 node-pty@^1.1.0——无 prebuilds，原厂 fnOS（**无 g++/make**，实测 dpkg.log 里
+  工具链都是手动装的）永远编译不出来，且 pnpm 10 默认拦截依赖构建脚本，市场装完终端
+  必坏（"node-pty 加载失败"）。dsh 核心的 node-pty 带全平台 prebuilds（linux-x64/arm64），
+  `--ignore-scripts` 安装即可加载（已实测 spawn OK）。seed-market 把 profile 的
+  pnpm override 钉到核心版本：**预写**（首次安装终端插件即直接解析到 prebuilt）、已装错
+  版本的下次启动自动 `pnpm install` 对齐、`dsh plugin add` 抹掉 override 也会在下次
+  启动自愈；升级 dshVersion 后核心版本变化时 override 自动跟随。插件的
+  `install.sh --repair`（现场编译路线）只在有工具链的机器上可用，不再是必要路径。
 
 已知限制（上游行为或网关固有，排障时先想到这些）：
 
-- 运行期安装的插件客户端，其根绝对路由只有 relay JS_PATH_RULES 覆盖到的形态
-  （`/api/`、`/plugins/`、`/assets/`、`/dsh-market/` 前缀 + 双/单/反引号字符串）会被
-  前缀化；更花哨的拼接形态不吃网关前缀（既有网关限制，与上游直连行为一致）。
+- **插件根绝对路由的通用兜底是 base-path 垫片**（relay 注入，包装 fetch/XHR/WebSocket/
+  EventSource/sendBeacon/script.src/pushState，同源根绝对 URL 调用层补前缀；契约测试
+  `scripts/test-base-path-shim.mjs`）。垫片盖不住的残余形态：裸动态 `import()`（不走
+  window.fetch；懒 chunk 走 `<script src>` 的已被 src setter 覆盖）、带 body 的
+  `Request` 实例重写会丢 body（字符串入参——所有已知调用方的形态——精确）。
+  JS_PATH_RULES 的字符串前缀化（`/api/`、`/plugins/`、`/assets/`、`/dsh-market/`、
+  `/sidebar/` + 三种引号）保留作双保险，覆盖非请求上下文里的字面量。
+- **fnOS 网关只把 `/app/<name>` 前缀的路由转发给应用 socket**：浏览器发到站点根的
+  unprefixed 请求（`/sidebar/...`）在网关层就 404，relay 侧无法补救——一切修复必须
+  让浏览器一开始就发对路径（垫片/字符串重写都是这个原因）。
 - 市场内安装只接受 awesome-dsh-plugin 目录里收录的包（上游的安全设计）。
 - skill 型/git 源安装依赖主机 `git`；`github:` 源走 pnpm 整仓下载，慢网下有超时重试。
 

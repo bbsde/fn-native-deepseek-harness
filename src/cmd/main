@@ -212,6 +212,12 @@ dsh_launch_env() {
   # npm/XDG caches are volatile by nature: they stay in @appdata so the
   # share only ever holds user-meaningful state.
   export HOME="$WORKSPACE_DIR"
+  # fnOS app accounts carry /usr/sbin/nologin as their passwd shell; plugins
+  # that spawn a terminal (dsh-better-sidebar resolves $SHELL first, then the
+  # passwd entry) would exec nologin — "This account is currently not
+  # available.", exit 1. Pin a real shell.
+  export SHELL="/bin/bash"
+  [ -x "$SHELL" ] || export SHELL="/bin/sh"
   export XDG_CACHE_HOME="${TRIM_PKGVAR}/.xdg/cache"
   export XDG_CONFIG_HOME="${TRIM_PKGVAR}/.xdg/config"
   export XDG_DATA_HOME="${TRIM_PKGVAR}/.xdg/data"
@@ -254,10 +260,20 @@ dsh_launch_env() {
   #   : | sudo tee $TRIM_PKGVAR/github-accel      (empty or "off" = off)
   local github_accel
   github_accel="$(github_accel_root)"
+  # fnOS grants the app user access to repo trees through ACL entries while
+  # the files stay owned by the human account; git's safe.directory ownership
+  # check then refuses every such repo ("detected dubious ownership") — the
+  # agent's own git calls and the sidebar's git tab both surface it as "not a
+  # git repository". The dsh account is an unprivileged service user whose
+  # whole job is working on admin-granted trees, so allow all (verified on
+  # fnOS git 2.39: safe.directory is honored through GIT_CONFIG_* env).
+  export GIT_CONFIG_KEY_0="safe.directory"
+  export GIT_CONFIG_VALUE_0="*"
+  local git_config_count=1
   if [ -n "$github_accel" ]; then
-    export GIT_CONFIG_COUNT=1
-    export GIT_CONFIG_KEY_0="url.${github_accel}https://github.com/.insteadOf"
-    export GIT_CONFIG_VALUE_0="https://github.com/"
+    export GIT_CONFIG_KEY_1="url.${github_accel}https://github.com/.insteadOf"
+    export GIT_CONFIG_VALUE_1="https://github.com/"
+    git_config_count=2
     # pnpm's GitHub tarball downloads (https://codeload.github.com/…) are
     # plain HTTPS, not git CLI — insteadOf cannot see them. The preload
     # rewrites those at the https.request/fetch layer; it must ride along
@@ -266,6 +282,7 @@ dsh_launch_env() {
     export DSH_GH_ACCEL="$github_accel"
     export NODE_OPTIONS="--require ${TRIM_APPDEST}/bin/gh-accel-preload.cjs${NODE_OPTIONS:+ ${NODE_OPTIONS}}"
   fi
+  export GIT_CONFIG_COUNT="$git_config_count"
   mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$npm_config_cache" 2>/dev/null || true
   return 0
 }
