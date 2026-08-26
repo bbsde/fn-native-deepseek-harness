@@ -32,9 +32,9 @@ jobs:
             fnpack_platform: linux-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
 
@@ -55,7 +55,7 @@ jobs:
         run: ./build.sh "$DSH_UPSTREAM"
 
       - name: Upload fpk artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: dsh-fpk-${{ matrix.arch }}
           path: dist/*.fpk

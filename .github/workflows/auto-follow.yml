@@ -34,7 +34,7 @@ jobs:
       pinned: ${{ steps.cmp.outputs.pinned }}
       changed: ${{ steps.cmp.outputs.changed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Compare npm latest with pinned dshVersion
         id: cmp
@@ -65,7 +65,7 @@ jobs:
     if: needs.check.outputs.changed == 'yes'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure git identity
         run: |
@@ -82,7 +82,7 @@ jobs:
           git push origin HEAD:main --follow-tags
 
       - name: Download fpk artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist-all
           pattern: dsh-fpk-*
