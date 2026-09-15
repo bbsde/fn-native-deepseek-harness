@@ -85,11 +85,14 @@ const CHANNEL_PATTERN_RULE = [
 // internal state no proxy can rewrite, and behind the relay every browser
 // request terminates on loopback behind an admin-gated gateway, which makes
 // the page loopback-equivalent — so the classification is pinned to true.
-// Server-side copies (lib/index.js) must stay untouched: their Host-header
-// fence is what the relay satisfies by rewriting Host/Origin.
+// 0.1.5-rc.x prepended a `transport?.ownsHost === true` clause to the same
+// expression (and kept the trailing comma) — the pin still covers it, since
+// browser requests all terminate on the relay either way. Server-side copies
+// (lib/index.js) must stay untouched: their Host-header fence is what the
+// relay satisfies by rewriting Host/Origin.
 const LOOPBACK_RULE = [
   [
-    'isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),',
+    'isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),',
     'isLoopback: true,',
   ],
 ]
@@ -365,7 +368,9 @@ const failures = []
   const connBundle = clientBundles.find((file) => file.includes('dsh-client-connection'))
   const jsNow = connBundle === undefined ? '' : fs.readFileSync(connBundle, 'utf8')
   if (
-    htmlNow.includes(`"${prefix}/assets/`) &&
+    // 0.1.5-rc.x shells reference assets relatively ("./assets/…"); older
+    // shells carried the rewritten root-absolute form. Both mean done.
+    (htmlNow.includes(`"${prefix}/assets/`) || htmlNow.includes('"./assets/')) &&
     !htmlNow.includes('manifest.webmanifest') &&
     jsNow.includes(`"${prefix}/api`) &&
     jsNow.includes(CHANNEL_PATTERN_RULE[0][1]) &&
@@ -399,7 +404,13 @@ patchPickerGrants(failures)
 }
 
 const html = fs.readFileSync(path.join(dist, 'index.html'), 'utf8')
-if (!html.includes(`"${prefix}/assets/`)) failures.push('index.html: no /assets/ rewrite landed')
+// 0.1.5-rc.x ships shell assets by relative specifier ("./assets/…"), which
+// the browser resolves against the already-prefixed document URL — no rewrite
+// wanted. The legacy root-absolute form must carry the gateway prefix instead.
+// Either shape is acceptable; neither means the shell would load assets from
+// outside the gateway and 404 at the fnOS layer.
+if (!html.includes('"./assets/') && !html.includes(`"${prefix}/assets/`))
+  failures.push('index.html: no /assets/ rewrite landed')
 
 const connectionBundle = clientBundles.find((file) => file.includes('dsh-client-connection'))
 if (connectionBundle === undefined) {

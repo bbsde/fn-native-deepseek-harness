@@ -126,7 +126,11 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
   输出 `dist/dsh_<版本>.fpk`（附 .info.txt），并把所用上游版本写回 `package.json` 的
   `dshVersion`（钉版是唯一上游版本来源，**精确钉死**，rc 阶段破坏性变更多）。
   同版本重复构建走快速路径（跳过远程安装与重写——rewrite-dist 带幂等预检）；换新版本自动
-  走全流程，**若上游打包方式变化，重写门禁会让构建大声失败**，此时按门禁报错更新规则集再重跑。
+  走全流程，**若上游打包方式变化，重写门禁会让构建大声失败**，此时按门禁报错更新规则集
+  再重跑。史例：2026-09-04 起 auto-follow 连败 11 天即此门禁在拦——0.1.5-rc.1 把外壳
+  index.html 的资源引用从根绝对（`"/assets/…`）**相对化**（`"./assets/…`，浏览器按已带
+  前缀的文档 URL 解析，无需重写）+ loopback 判定表达式加了 `transport?.ownsHost === true`
+  前缀，两处规则集更新后恢复。
 - **工作区就在 fnOS 机器上时（HOME-NAS：/vol3/1000/Projects/fn-native-deepseek-harness）**：
   `DSH_BUILD_HOST=local DSH_WRAPPER_BUILD=1 ./build.sh 0.1.0-rc.6`，fetch 直接在本机
   nodejs_v24 下装进 `cache/`，不再走 SSH。npm 缓存重定向到 `cache/npm-cache`（本机
@@ -136,9 +140,15 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
 - **npm install 必须在 Linux x64 上执行**：dsh 有原生依赖 node-pty（需编译或预编译产物）
   和 koffi（install 脚本装原生模块），Windows/`--ignore-scripts` 装出的树在 fnOS 上必崩
   （症状：plugin tree failed to load / pty.node not found / Koffi missing）。
-  `fetch-dsh.mjs` 通过 SSH 在构建机（`DSH_BUILD_HOST`，默认 nas31）上用设备同款
-  nodejs_v24 运行时安装，tar 回传（保符号链接），并校验 pty.node 是 Linux ELF。
-- nas31 需要一次性装好工具链：`sudo apt-get install -y g++ make python3`（node-pty 编译用）。
+  `fetch-dsh.mjs` 的构建机由 `DSH_BUILD_HOST` 选择，**默认 `local`**（fnOS 本机 x86 或
+  CI 的原生 arm64 runner 直装，要求 node major 24——fnOS 的 nodejs_v24 满足，普通 Linux
+  x64 机需自备 node 24）；`DSH_BUILD_HOST=nas31` 才走 SSH 远程安装（设备同款
+  nodejs_v24 运行时，tar 回传保符号链接，并校验 pty.node 是 Linux ELF）。
+  **Windows 开发机做不了本地全量构建**（无 node 24、npm ci 会装出 Windows ABI 的原生
+  模块、且无 nas31 免密配置）——Windows 上的构建一律交给 CI（push 后 auto-follow 或
+  打 tag 出 release）；本地只能做纯解析类步骤（如 lockfile 生成）和 rewrite 预演。
+- nas31（若启用远程路径）需一次性装好工具链：`sudo apt-get install -y g++ make python3`
+  （node-pty 编译用）。
 - **npm registry**：nas31 远程路径与 fnOS 本机路径默认走 npmmirror（`registry.npmmirror.com`，
   node-gyp 头文件同步走镜像）——CN 网络下 npmjs 直连一个 535 包的冷安装要 ~10 分钟，
   镜像把下载瓶颈消掉后剩 node-pty 编译本身；CI 的美国 runner 保持 npmjs。
@@ -156,7 +166,9 @@ npm run build           # 等价于 build.sh 的钉版路径（不查 npm、不�
   生成后重写），本地与远程安装路径按各自 registry 就地重写（走 npmmirror 时改写为镜像
   URL；integrity 哈希不变，镜像字节相同），安装一律 `npm ci` 跳过解析。
   **升级 dshVersion 后必须删旧锁**（名字带版本对，正常自动失效）；丢了锁文件的下一次
-  构建会重新进入漫长的解析阶段。
+  构建会重新进入解析阶段。**0.1.5 起的新依赖图实测已无此病态**（2026-09 实测：CI
+  runner 31s、Windows 本机 15s 完成 `--package-lock-only`），lockfile 机制保留，价值
+  变为双架构装出同一确定性树。
 - **fnOS `platform` 字段取值**：`x86`（仅 x86 设备）/ `arm`（仅 ARM 设备）/ `all`（同时支持，但仅当包内不含架构特定二进制时）。本应用内含架构相关的原生模块（node-pty/koffi/ripgrep 都是特定架构的 .node/.so），**不能用 `all`**——必须出两个独立包（`platform=x86` 与 `platform=arm`），分别安装到对应架构设备。
 
 ### 双架构发布（GitHub Actions）
@@ -214,10 +226,13 @@ artifact 只含 `dist/*.fpk`（info.txt 不上传、不进 Release 附件）。
   网关后面必然非回环 → settings 镜像进 "memory" 模式、一个 RPC 都不发，模型页报
   "settings are unavailable in this browser"（relay 骗得了服务端 Host 头，骗不了浏览器
   内部的 location）。规则把该判定钉成 `isLoopback: true`（本 fpk 里浏览器等价回环：
-  请求全部经 relay 回环终结 + 管理员闸门）。门禁是家族标记
-  `isLoopbackHostname(pageLocation.hostname)`——上游改写该表达式形态会触发 fail；
-  上游整个改名（pageLocation 换名）则标记消失、静默不补，升级后要人工确认模型页可用。
-  服务端副本 lib/index.js 的 Host 头 fence 必须保持原样（relay 靠它放行）。
+  请求全部经 relay 回环终结 + 管理员闸门）。**0.1.5-rc.x 起表达式多了
+  `transport?.ownsHost === true ||` 前缀（语义仍是"请求在本机终结即回环等价"，钉 true
+  照样覆盖）**。门禁是家族标记 `isLoopbackHostname(pageLocation.hostname)`——上游改写
+  该表达式形态会触发 fail；上游整个改名（pageLocation 换名）则标记消失、静默不补，
+  升级后要人工确认模型页可用。服务端副本 lib/index.js 的 Host 头 fence 必须保持原样
+  （relay 靠它放行；重写脚本按构造就只碰 `./client` 导出目标与 web-frontend dist，
+  服务端副本天然不在扫描范围）。
 - glob/grep 工具不用系统 `rg`，而是 spawn 上游 vendor 的
   `node_modules/@vscode/ripgrep-linux-<arch>/bin/rg`——树里唯一必须带执行位的文件
   （.node/.so 走 dlopen 只要读权限）。旧 Windows/MSYS tar 往返构建曾丢过该执行位：
@@ -385,11 +400,15 @@ getfacl 可见、实际不生效，祖先层的列举权授不出来（fn-native
 
 测试机已配好 SSH 免密别名：`~/.ssh/config` → `Host nas31`（192.168.0.31，用户 李承龙，
 x86_64，fnOS 1.1.3105）。`appcenter-cli` 在 `/usr/local/bin/appcenter-cli`，**需要 sudo**。
+**这套 SSH 流程只在 fnOS 机器侧的 shell（HOME-NAS 工作区）可用**——Windows 开发机没有
+`~/.ssh`（2026-09 实测：无 config、无 known_hosts、nas31 免密未配置），从 Windows 上
+`ssh nas31` 只会报 hostname 解析失败；Windows 侧的安装验证走 GitHub Release 下载 fpk
+后由用户在桌面页面上传。
 
 一轮完整生命周期：
 
 ```bash
-npm run build                                        # 1. 本地出 fpk（fetch 在 nas31 上远程执行）
+npm run build                                        # 1. 本地出 fpk（fnOS 本机 nodejs_v24 直装；DSH_BUILD_HOST 默认 local）
 scp src/dsh.fpk nas31:/tmp/                          # 2. 上传
 ssh nas31 'sudo /usr/local/bin/appcenter-cli install-fpk --volume 1 /tmp/dsh.fpk'   # 3. 安装
 ssh nas31 'sudo /usr/local/bin/appcenter-cli start dsh'        # 4. 启动

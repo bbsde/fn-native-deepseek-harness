@@ -16,7 +16,11 @@ import path from 'path'
 import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const run = (command, cwd) => execSync(command, { cwd, stdio: 'inherit' })
+// env must be passed as an object: `VAR=x cmd` env-prefix syntax inside the
+// command string is POSIX-shell-only and cmd.exe (the Windows execSync
+// default) rejects it outright.
+const run = (command, cwd, extraEnv) =>
+  execSync(command, { cwd, stdio: 'inherit', env: extraEnv ? { ...process.env, ...extraEnv } : undefined })
 
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 const manifest = path.join(root, 'src', 'manifest')
@@ -28,9 +32,9 @@ const platformFor = (arch) => (arch === 'arm64' ? 'arm' : 'x86')
 for (const arch of archs) {
   const pkgPlatform = platformFor(arch)
   console.log(`=== build.mjs: architecture ${arch} (platform=${pkgPlatform}) ===`)
-  run(`DSH_ARCH=${arch} node scripts/fetch-dsh.mjs`, root)
-  run(`DSH_ARCH=${arch} node scripts/rewrite-dist.mjs`, root)
-  run(`DSH_ARCH=${arch} node scripts/pack-runtime.mjs`, root)
+  run('node scripts/fetch-dsh.mjs', root, { DSH_ARCH: arch })
+  run('node scripts/rewrite-dist.mjs', root, { DSH_ARCH: arch })
+  run('node scripts/pack-runtime.mjs', root, { DSH_ARCH: arch })
   // Keep only runtime.tar.gz inside src/app (fnpack packs the whole tree;
   // stray arch tars would bloat every fpk by 60+ MB).
   for (const stale of fs.readdirSync(path.join(root, 'src', 'app'))) {
